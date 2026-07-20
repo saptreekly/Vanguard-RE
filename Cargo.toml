@@ -1,0 +1,39 @@
+[package]
+name = "vanguard-re"
+version = "0.1.0"
+edition = "2024"
+description = "High-speed, memory-safe static malware triage and reverse engineering toolkit"
+license = "MIT"
+authors = ["Vanguard-RE Contributors"]
+repository = "https://github.com/vanguard-re/vanguard-re"
+keywords = ["malware", "reverse-engineering", "pe", "elf", "yara"]
+categories = ["command-line-utilities", "parsing"]
+
+[[bin]]
+name = "vanguard"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+crossterm = "0.28"
+goblin = "0.10"
+hex = "0.4"
+iced-x86 = { version = "1", features = ["std"] }
+md-5 = "0.10"
+memmap2 = "0.9"
+ratatui = "0.30"
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+symbolic-common = "12"
+symbolic-demangle = "12"
+walkdir = "2"
+yara-x = "=1.19.0"
+zip = { version = "2", default-features = false, features = ["aes-crypto", "deflate"] }
+
+[profile.release]
+lto = false
+codegen-units = 16
+panic = "abort"
+strip = true
