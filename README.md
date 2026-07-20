@@ -44,9 +44,13 @@ Passworded malware packs (e.g. password `infected`) are decrypted into RAM only,
 
 | Key | Action |
 |-----|--------|
-| ↑↓ / j k | Move |
-| Enter | Select / run / open deep-dive |
-| Tab | Next form field |
+| ↑↓ / j k | Move / step instructions |
+| Enter | Select / run / deep-dive / follow call |
+| Tab | Next form field / switch disasm pane |
+| d | Open function-map disasm explorer |
+| [ ] | Previous / next recovered function |
+| c | Cycle k-means function cluster filter |
+| u / Backspace | Back after follow-call (or leave explorer) |
 | b | Back to ranking (from deep-dive) |
 | Esc / q | Back / quit |
 

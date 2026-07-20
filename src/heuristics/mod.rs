@@ -1,5 +1,9 @@
 //! Heuristic & API threat scoring (IAT behavioral profiling).
 
+mod capabilities;
+
+pub use capabilities::{capability_summary, tag_capabilities, CapabilityTag};
+
 use serde::Serialize;
 
 use crate::triage::ImportEntry;
@@ -20,6 +24,8 @@ pub struct ThreatScore {
     pub label: String,
     pub behaviors: Vec<BehaviorMatch>,
     pub suspicious_apis: Vec<String>,
+    /// CAPA-style capability tags derived from imports.
+    pub capabilities: Vec<CapabilityTag>,
 }
 
 /// High-risk Windows APIs frequently abused by malware.
@@ -255,21 +261,45 @@ pub fn score_imports(imports: &[ImportEntry]) -> ThreatScore {
     // Aggregate: max pattern severity, plus small bump for suspicious API density
     let max_sev = behaviors.iter().map(|b| b.severity).max().unwrap_or(0);
     let density_bump = (suspicious_apis.len().min(20) as u8).saturating_mul(2);
-    let score = max_sev.saturating_add(density_bump).min(100);
+    let capabilities = tag_capabilities(imports);
+    // Capability diversity bump (high-signal tags weigh more).
+    let cap_bump: u8 = capabilities
+        .iter()
+        .map(|c| match c.id.as_str() {
+            "injection" => 12,
+            "c2" | "keylog" | "privilege" => 8,
+            "persistence" | "crypto" | "anti_debug" => 6,
+            _ => 3,
+        })
+        .fold(0u8, |a, b| a.saturating_add(b))
+        .min(24);
+    let score = max_sev
+        .saturating_add(density_bump)
+        .saturating_add(cap_bump)
+        .min(100);
 
-    let label = match score {
-        0..=19 => "benign / low interest",
-        20..=39 => "suspicious",
-        40..=69 => "likely malicious tooling",
-        70..=89 => "high risk",
-        _ => "critical — injection / hollow patterns",
-    }
-    .to_string();
+    let label = if !capabilities.is_empty() && score >= 40 {
+        let top: Vec<_> = capabilities.iter().take(3).map(|c| c.id.as_str()).collect();
+        format!("{} — {}", risk_label(score), top.join("/"))
+    } else {
+        risk_label(score).to_string()
+    };
 
     ThreatScore {
         score,
         label,
         behaviors,
         suspicious_apis,
+        capabilities,
+    }
+}
+
+fn risk_label(score: u8) -> &'static str {
+    match score {
+        0..=19 => "benign / low interest",
+        20..=39 => "suspicious",
+        40..=69 => "likely malicious tooling",
+        70..=89 => "high risk",
+        _ => "critical — injection / hollow patterns",
     }
 }

@@ -110,13 +110,44 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
             },
             Screen::Running => {}
             Screen::Results => match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => app.back_to_menu(),
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    if app.deep_index.is_some() {
+                        app.back_to_results_list();
+                    } else {
+                        app.back_to_menu();
+                    }
+                }
                 KeyCode::Up | KeyCode::Char('k') => app.results_up(),
                 KeyCode::Down | KeyCode::Char('j') => app.results_down(),
                 KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => app.open_deep_dive(),
+                KeyCode::Char('d') => {
+                    if app.deep_index.is_some() {
+                        app.open_disasm_explorer();
+                    } else {
+                        app.open_deep_dive();
+                        app.open_disasm_explorer();
+                    }
+                }
                 KeyCode::Char('b') => app.back_to_results_list(),
                 KeyCode::PageUp => app.results_page(-10),
                 KeyCode::PageDown => app.results_page(10),
+                _ => {}
+            },
+            Screen::DisasmExplorer => match key.code {
+                KeyCode::Esc => app.disasm_nav_back(),
+                KeyCode::Char('q') => app.back_to_menu(),
+                KeyCode::Tab | KeyCode::BackTab => app.disasm_toggle_focus(),
+                KeyCode::Up | KeyCode::Char('k') => app.disasm_move(-1),
+                KeyCode::Down | KeyCode::Char('j') => app.disasm_move(1),
+                KeyCode::PageUp => app.disasm_move(-16),
+                KeyCode::PageDown => app.disasm_move(16),
+                KeyCode::Char('[') => app.disasm_next_function(-1),
+                KeyCode::Char(']') => app.disasm_next_function(1),
+                KeyCode::Char('c') => app.disasm_cycle_cluster_filter(),
+                KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => app.disasm_follow_call(),
+                KeyCode::Backspace | KeyCode::Char('u') | KeyCode::Left | KeyCode::Char('h') => {
+                    app.disasm_nav_back()
+                }
                 _ => {}
             },
             Screen::About => match key.code {

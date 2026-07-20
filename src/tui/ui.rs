@@ -7,7 +7,7 @@ use ratatui::Frame;
 use vanguard_re::containment::containment_policy;
 use vanguard_re::investigate::short_name;
 
-use super::app::{App, FormField, Screen};
+use super::app::{App, DisasmFocus, FormField, Screen};
 
 const ACCENT: Color = Color::Cyan;
 const WARN: Color = Color::Yellow;
@@ -37,6 +37,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
         Screen::InvestigateForm => draw_form(frame, app, area),
         Screen::Running => draw_running(frame, app, area),
         Screen::Results => draw_results(frame, app, area),
+        Screen::DisasmExplorer => draw_disasm_explorer(frame, app, area),
         Screen::About => draw_about(frame, area),
         Screen::Error => draw_error(frame, app, area),
     }
@@ -362,8 +363,31 @@ fn draw_results(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let list = List::new(items).block(title_block("ranking  ·  enter = deep-dive"));
     frame.render_widget(list, chunks[1]);
 
-    // Side summary: YARA + ImpHash siblings
+    // Side summary: capabilities + YARA + ImpHash siblings
     let mut summary_lines = Vec::new();
+    summary_lines.push(Line::from(Span::styled(
+        "CAPABILITIES",
+        Style::default()
+            .fg(ACCENT)
+            .add_modifier(Modifier::BOLD),
+    )));
+    let top = report.triage.first();
+    if let Some(t) = top {
+        if t.threat.capabilities.is_empty() {
+            summary_lines.push(Line::from(Span::styled(
+                "  (none on top sample)",
+                Style::default().fg(MUTED),
+            )));
+        } else {
+            for cap in t.threat.capabilities.iter().take(8) {
+                summary_lines.push(Line::from(Span::styled(
+                    format!("  {:>3}  {:<14}  {}", cap.confidence, cap.id, cap.label),
+                    Style::default().fg(FG),
+                )));
+            }
+        }
+    }
+    summary_lines.push(Line::from(""));
     summary_lines.push(Line::from(Span::styled(
         "YARA",
         Style::default()
@@ -442,8 +466,8 @@ fn draw_deep_dive(frame: &mut Frame<'_>, app: &App, area: Rect, di: usize) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(6),
-            Constraint::Percentage(30),
+            Constraint::Length(7),
+            Constraint::Percentage(28),
             Constraint::Min(8),
             Constraint::Length(3),
         ])
@@ -477,6 +501,21 @@ fn draw_deep_dive(frame: &mut Frame<'_>, app: &App, area: Rect, di: usize) {
         Line::from(Span::styled(
             format!("behaviors  {}", dive.reason.replace(", ", " · ")),
             Style::default().fg(FG),
+        )),
+        Line::from(Span::styled(
+            format!(
+                "caps  {}",
+                if dive.capabilities.is_empty() {
+                    "(none)".into()
+                } else {
+                    dive.capabilities
+                        .iter()
+                        .map(|c| format!("{}({})", c.id, c.confidence))
+                        .collect::<Vec<_>>()
+                        .join(" · ")
+                }
+            ),
+            Style::default().fg(WARN),
         )),
         Line::from(Span::styled(
             format!(
@@ -525,7 +564,12 @@ fn draw_deep_dive(frame: &mut Frame<'_>, app: &App, area: Rect, di: usize) {
     let mut disasm_lines = Vec::new();
     if let Some(d) = &dive.disasm {
         disasm_lines.push(Line::from(Span::styled(
-            format!("disasm  {} @ {:#x}", d.architecture, d.start_address),
+            format!(
+                "disasm  {} @ {:#x}  ·  {} functions  ·  press d to explore",
+                d.architecture,
+                d.start_address,
+                d.functions.len()
+            ),
             Style::default()
                 .fg(ACCENT)
                 .add_modifier(Modifier::BOLD),
@@ -572,13 +616,237 @@ fn draw_deep_dive(frame: &mut Frame<'_>, app: &App, area: Rect, di: usize) {
     let help = Paragraph::new(Line::from(vec![
         Span::styled("↑↓", Style::default().fg(ACCENT)),
         Span::styled(" next deep-dive  ", Style::default().fg(MUTED)),
+        Span::styled("d/enter", Style::default().fg(ACCENT)),
+        Span::styled(" functions  ", Style::default().fg(MUTED)),
         Span::styled("b", Style::default().fg(ACCENT)),
-        Span::styled(" back to ranking  ", Style::default().fg(MUTED)),
+        Span::styled(" ranking  ", Style::default().fg(MUTED)),
         Span::styled("esc", Style::default().fg(ACCENT)),
-        Span::styled(" menu", Style::default().fg(MUTED)),
+        Span::styled(" ranking", Style::default().fg(MUTED)),
     ]))
     .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(MUTED)));
     frame.render_widget(help, chunks[3]);
+}
+
+fn draw_disasm_explorer(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    use vanguard_re::disasm::FlowKind;
+    use vanguard_re::investigate::short_name;
+
+    let Some(nav) = &app.disasm_nav else {
+        return;
+    };
+    let Some(report) = &app.report else {
+        return;
+    };
+    let Some(dive) = report.deep_dives.get(nav.dive_index) else {
+        return;
+    };
+    let Some(d) = &dive.disasm else {
+        return;
+    };
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(8), Constraint::Length(3)])
+        .split(area);
+
+    let fn_count = d.functions.len();
+    let cur = d.functions.get(nav.fn_index);
+    let cur_name = cur.map(|f| f.name.as_str()).unwrap_or("listing");
+    let cur_interest = cur.map(|f| f.interest).unwrap_or(0);
+    let filter_note = match nav.cluster_filter {
+        Some(id) => d
+            .clusters
+            .iter()
+            .find(|c| c.id == id)
+            .map(|c| format!("filter:c{id}/{}", c.label))
+            .unwrap_or_else(|| format!("filter:c{id}")),
+        None => format!("{} clusters", d.clusters.len()),
+    };
+    let header = Paragraph::new(Line::from(vec![
+        Span::styled(
+            "FUNCTION MAP  ",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(short_name(&dive.path), Style::default().fg(Color::White)),
+        Span::styled(
+            format!(
+                "  ·  {fn_count} funcs  ·  {cur_name}★{cur_interest}  ·  {filter_note}  ·  {}",
+                d.architecture
+            ),
+            Style::default().fg(MUTED),
+        ),
+    ]))
+    .block(title_block("disasm"));
+    frame.render_widget(header, chunks[0]);
+
+    let body = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(32), Constraint::Percentage(68)])
+        .split(chunks[1]);
+
+    // —— function list (interest-sorted, optional cluster filter) ——
+    let fn_items: Vec<ListItem> = if d.functions.is_empty() {
+        vec![ListItem::new(Line::from(Span::styled(
+            "  (linear listing only)",
+            Style::default().fg(MUTED),
+        )))]
+    } else {
+        d.functions
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| nav.cluster_filter.map_or(true, |c| f.cluster_id == c))
+            .map(|(i, f)| {
+                let selected = i == nav.fn_index;
+                let prefix = if selected { "▸ " } else { "  " };
+                let label = format!(
+                    "{prefix}{:>3}  c{} {:<14} {:#x}",
+                    f.interest,
+                    f.cluster_id,
+                    truncate(&f.name, 14),
+                    f.start
+                );
+                let style = if selected && nav.focus == DisasmFocus::Functions {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(ACCENT)
+                        .add_modifier(Modifier::BOLD)
+                } else if selected {
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+                } else if f.interest >= 70 {
+                    Style::default().fg(WARN)
+                } else {
+                    Style::default().fg(FG)
+                };
+                ListItem::new(Line::from(Span::styled(label, style)))
+            })
+            .collect()
+    };
+    let fn_border = if nav.focus == DisasmFocus::Functions {
+        ACCENT
+    } else {
+        MUTED
+    };
+    frame.render_widget(
+        List::new(fn_items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(fn_border))
+                .title(Span::styled(
+                    " functions ★interest · c# cluster ",
+                    Style::default().fg(fn_border).add_modifier(Modifier::BOLD),
+                )),
+        ),
+        body[0],
+    );
+
+    // —— instruction listing ——
+    let (span_start, span_end) = if let Some(f) = d.functions.get(nav.fn_index) {
+        (f.insn_start, f.insn_end)
+    } else {
+        (0, d.instructions.len().saturating_sub(1))
+    };
+    let visible_h = body[1].height.saturating_sub(2) as usize;
+    let cursor = nav.insn_cursor;
+    let scroll = cursor.saturating_sub(visible_h.saturating_sub(1) / 2);
+
+    let mut listing_lines: Vec<Line> = Vec::new();
+    let total = span_end.saturating_sub(span_start) + 1;
+    for rel in scroll..total.min(scroll + visible_h.max(1)) {
+        let idx = span_start + rel;
+        let Some(line) = d.instructions.get(idx) else {
+            break;
+        };
+        let selected = rel == cursor;
+        let marker = if selected { "→ " } else { "  " };
+
+        if line.is_function_start && rel != cursor {
+            let fname = d
+                .functions
+                .iter()
+                .find(|f| f.start == line.address)
+                .map(|f| f.name.as_str())
+                .unwrap_or("sub");
+            listing_lines.push(Line::from(Span::styled(
+                format!("  ; ---- {fname} ----"),
+                Style::default().fg(MUTED),
+            )));
+        }
+
+        let target_note = match line.branch_target {
+            Some(t) => match vanguard_re::disasm::function_name_at(&d.functions, t) {
+                Some(name) => format!("  → {name}"),
+                None => format!("  → {t:#x}"),
+            },
+            None => String::new(),
+        };
+        let flag = if line.anti_debug {
+            "  !"
+        } else if line.flow == FlowKind::Call {
+            "  call"
+        } else if line.flow == FlowKind::Return {
+            "  ret"
+        } else {
+            ""
+        };
+
+        let text = format!(
+            "{marker}{:#010x}  {:<12}  {}{target_note}{flag}",
+            line.address,
+            truncate(&line.bytes, 12),
+            line.text,
+        );
+        let row_style = if selected && nav.focus == DisasmFocus::Listing {
+            Style::default().fg(Color::Black).bg(ACCENT)
+        } else if selected {
+            Style::default().fg(ACCENT)
+        } else if line.anti_debug {
+            Style::default().fg(BAD)
+        } else if line.flow == FlowKind::Call {
+            Style::default().fg(WARN)
+        } else if line.flow == FlowKind::Return {
+            Style::default().fg(MUTED)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        listing_lines.push(Line::from(Span::styled(text, row_style)));
+    }
+
+    let list_border = if nav.focus == DisasmFocus::Listing {
+        ACCENT
+    } else {
+        MUTED
+    };
+    frame.render_widget(
+        Paragraph::new(listing_lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(list_border))
+                .title(Span::styled(
+                    " listing  ·  enter = follow call ",
+                    Style::default().fg(list_border).add_modifier(Modifier::BOLD),
+                )),
+        ),
+        body[1],
+    );
+
+    let help = Paragraph::new(Line::from(vec![
+        Span::styled("↑↓", Style::default().fg(ACCENT)),
+        Span::styled(" step  ", Style::default().fg(MUTED)),
+        Span::styled("tab", Style::default().fg(ACCENT)),
+        Span::styled(" pane  ", Style::default().fg(MUTED)),
+        Span::styled("enter", Style::default().fg(ACCENT)),
+        Span::styled(" follow  ", Style::default().fg(MUTED)),
+        Span::styled("u", Style::default().fg(ACCENT)),
+        Span::styled(" back  ", Style::default().fg(MUTED)),
+        Span::styled("[]", Style::default().fg(ACCENT)),
+        Span::styled(" fn  ", Style::default().fg(MUTED)),
+        Span::styled("c", Style::default().fg(ACCENT)),
+        Span::styled(" cluster  ", Style::default().fg(MUTED)),
+        Span::styled("esc", Style::default().fg(ACCENT)),
+        Span::styled(" close", Style::default().fg(MUTED)),
+    ]))
+    .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(MUTED)));
+    frame.render_widget(help, chunks[2]);
 }
 
 fn draw_about(frame: &mut Frame<'_>, area: Rect) {

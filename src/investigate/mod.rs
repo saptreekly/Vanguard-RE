@@ -8,7 +8,7 @@ use serde::Serialize;
 
 use crate::containment::QuarantinedSample;
 use crate::disasm::{disassemble, interesting_strings, DisasmReport, ExtractedString};
-use crate::heuristics::score_imports;
+use crate::heuristics::{capability_summary, score_imports, CapabilityTag};
 use crate::signatures::{build_hash_bundle, scan_yara, YaraMatch};
 use crate::triage::{detect_packer_hints, parse_binary_named, TriageReport};
 use crate::util::sha256_hex;
@@ -28,6 +28,7 @@ pub struct DeepDive {
     pub sha256: String,
     pub score: u8,
     pub reason: String,
+    pub capabilities: Vec<CapabilityTag>,
     pub yara: Vec<YaraMatch>,
     pub interesting_strings: Vec<ExtractedString>,
     pub disasm: Option<DisasmReport>,
@@ -56,7 +57,7 @@ impl Default for InvestigateOptions<'_> {
     fn default() -> Self {
         Self {
             deep: 3,
-            disasm_count: 48,
+            disasm_count: 512,
             yara_rules: None,
             min_deep_score: 70,
         }
@@ -169,23 +170,30 @@ pub fn investigate(
             }
         };
 
-        let reason = r
-            .threat
-            .behaviors
-            .iter()
-            .map(|b| b.name.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
+        let reason = {
+            let caps = capability_summary(&r.threat.capabilities);
+            let behaviors = r
+                .threat
+                .behaviors
+                .iter()
+                .map(|b| b.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            if !behaviors.is_empty() {
+                format!("{behaviors}  |  caps: {caps}")
+            } else if caps != "(none)" {
+                format!("{}  |  caps: {caps}", r.threat.label)
+            } else {
+                r.threat.label.clone()
+            }
+        };
 
         deep_dives.push(DeepDive {
             path: r.path.clone(),
             sha256: r.sha256.clone(),
             score: r.threat.score,
-            reason: if reason.is_empty() {
-                r.threat.label.clone()
-            } else {
-                reason
-            },
+            reason,
+            capabilities: r.threat.capabilities.clone(),
             yara,
             interesting_strings: strings,
             disasm,

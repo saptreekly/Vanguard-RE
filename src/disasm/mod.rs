@@ -1,10 +1,30 @@
-//! High-speed static disassembler (iced-x86) + string extraction / back-trace.
+//! High-speed static disassembler (iced-x86) + function recovery + strings.
+
+mod cluster;
+
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{bail, Context, Result};
-use iced_x86::{Decoder, DecoderOptions, Formatter, Instruction, NasmFormatter};
+use iced_x86::{
+    Decoder, DecoderOptions, FlowControl, Formatter, Instruction, NasmFormatter, OpKind,
+};
 use serde::Serialize;
 
 use crate::triage::{parse_binary, BinaryFormat, ParsedBinary};
+
+use cluster::{choose_k, function_features, kmeans, label_cluster, FEATURE_DIM};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FlowKind {
+    Fallthrough,
+    Call,
+    Jump,
+    CondJump,
+    Return,
+    Interrupt,
+    Other,
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DisasmLine {
@@ -12,6 +32,35 @@ pub struct DisasmLine {
     pub bytes: String,
     pub text: String,
     pub anti_debug: bool,
+    pub flow: FlowKind,
+    /// Near/branch target when statically resolvable.
+    pub branch_target: Option<u64>,
+    pub is_function_start: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FunctionInfo {
+    pub name: String,
+    pub start: u64,
+    pub end: u64,
+    /// Inclusive index range into [`DisasmReport::instructions`].
+    pub insn_start: usize,
+    pub insn_end: usize,
+    pub callees: Vec<u64>,
+    pub callers: Vec<u64>,
+    /// 0–100 analyst interest (calls, anti-debug, string xrefs, entry).
+    pub interest: u8,
+    /// k-means cluster id (within this binary).
+    pub cluster_id: u8,
+    pub cluster_label: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FunctionCluster {
+    pub id: u8,
+    pub label: String,
+    pub members: Vec<String>,
+    pub size: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -29,6 +78,9 @@ pub struct DisasmReport {
     pub architecture: String,
     pub start_address: u64,
     pub instructions: Vec<DisasmLine>,
+    pub functions: Vec<FunctionInfo>,
+    /// Visual clustering layer over recovered functions.
+    pub clusters: Vec<FunctionCluster>,
     pub strings: Vec<ExtractedString>,
 }
 
@@ -43,6 +95,25 @@ fn is_anti_debug(text: &str) -> bool {
         || t.contains("sidt")
         || t.contains("sgdt")
         || t.contains("sldt")
+}
+
+fn classify_flow(instr: &Instruction) -> (FlowKind, Option<u64>) {
+    let target = match instr.op0_kind() {
+        OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64 => {
+            Some(instr.near_branch_target())
+        }
+        _ => None,
+    };
+    let flow = match instr.flow_control() {
+        FlowControl::Next => FlowKind::Fallthrough,
+        FlowControl::Call => FlowKind::Call,
+        FlowControl::UnconditionalBranch => FlowKind::Jump,
+        FlowControl::ConditionalBranch => FlowKind::CondJump,
+        FlowControl::Return => FlowKind::Return,
+        FlowControl::Interrupt => FlowKind::Interrupt,
+        _ => FlowKind::Other,
+    };
+    (flow, target)
 }
 
 /// Map a virtual address to `(absolute_file_offset, bytes_from_there, ip)`.
@@ -62,16 +133,6 @@ fn locate_va<'a>(
             if off < data.len() {
                 return Ok((off, &data[off..], va));
             }
-        }
-    }
-
-    // PE: entry is often an RVA; try image-base–relative if sections use VAs with high base
-    if binary.format == BinaryFormat::Pe {
-        for sec in &binary.sections {
-            let start = sec.virtual_address;
-            // If caller passed RVA (small) but sections store RVA already (goblin does),
-            // the loop above should have hit. Fallback: treat as file offset.
-            let _ = start;
         }
     }
 
@@ -159,28 +220,283 @@ pub fn disassemble(
         let raw = data.get(start_idx..end_idx.min(data.len())).unwrap_or(&[]);
         let bytes = hex::encode(raw);
 
+        let (flow, branch_target) = classify_flow(&instr);
         let anti = is_anti_debug(&text);
         instructions.push(DisasmLine {
             address: instr.ip(),
             bytes,
             text,
             anti_debug: anti,
+            flow,
+            branch_target,
+            is_function_start: false,
         });
     }
 
+    let mut functions = recover_functions(&mut instructions, start, &binary.exports);
     let strings = if with_strings {
         extract_strings_with_xrefs(data, &instructions)
     } else {
         Vec::new()
     };
+    rank_functions(&instructions, &mut functions, &strings, start);
+    let clusters = cluster_functions(&instructions, &mut functions);
+
+    // Surface interesting functions first (keep entry near top via interest bump).
+    functions.sort_by(|a, b| {
+        b.interest
+            .cmp(&a.interest)
+            .then(a.start.cmp(&b.start))
+    });
 
     Ok(DisasmReport {
         path: path.to_string(),
         architecture: binary.architecture,
         start_address: start,
         instructions,
+        functions,
+        clusters,
         strings,
     })
+}
+
+/// Recover function boundaries from entry + near CALL targets within the decode window.
+fn recover_functions(
+    instructions: &mut [DisasmLine],
+    entry: u64,
+    exports: &[String],
+) -> Vec<FunctionInfo> {
+    if instructions.is_empty() {
+        return Vec::new();
+    }
+
+    let addr_to_idx: BTreeMap<u64, usize> = instructions
+        .iter()
+        .enumerate()
+        .map(|(i, l)| (l.address, i))
+        .collect();
+
+    let min_addr = instructions.first().map(|l| l.address).unwrap_or(0);
+    let max_addr = instructions.last().map(|l| l.address).unwrap_or(0);
+
+    let mut starts: BTreeSet<u64> = BTreeSet::new();
+    if entry >= min_addr && entry <= max_addr {
+        starts.insert(entry);
+    } else if let Some(first) = instructions.first() {
+        starts.insert(first.address);
+    }
+
+    for line in instructions.iter() {
+        if line.flow == FlowKind::Call {
+            if let Some(t) = line.branch_target {
+                if addr_to_idx.contains_key(&t) {
+                    starts.insert(t);
+                }
+            }
+        }
+    }
+
+    // Mark starts on instruction list.
+    for s in &starts {
+        if let Some(&idx) = addr_to_idx.get(s) {
+            instructions[idx].is_function_start = true;
+        }
+    }
+
+    let start_list: Vec<u64> = starts.into_iter().collect();
+    let mut functions = Vec::with_capacity(start_list.len());
+
+    for (fi, &start_addr) in start_list.iter().enumerate() {
+        let Some(&insn_start) = addr_to_idx.get(&start_addr) else {
+            continue;
+        };
+        let insn_end = start_list
+            .get(fi + 1)
+            .and_then(|next| addr_to_idx.get(next).copied())
+            .map(|n| n.saturating_sub(1))
+            .unwrap_or(instructions.len().saturating_sub(1))
+            .max(insn_start);
+
+        let end = insn_end;
+
+        let mut callees = Vec::new();
+        for line in &instructions[insn_start..=end] {
+            if line.flow == FlowKind::Call {
+                if let Some(t) = line.branch_target {
+                    if addr_to_idx.contains_key(&t) {
+                        callees.push(t);
+                    }
+                }
+            }
+        }
+        callees.sort_unstable();
+        callees.dedup();
+
+        let name = if start_addr == entry {
+            "entry".into()
+        } else if let Some(exp) = exports.iter().find(|e| {
+            // best-effort: export name hint only when address matches aren't available
+            e.contains(&format!("{start_addr:x}"))
+        }) {
+            exp.clone()
+        } else {
+            format!("sub_{start_addr:x}")
+        };
+
+        functions.push(FunctionInfo {
+            name,
+            start: start_addr,
+            end: instructions[end].address,
+            insn_start,
+            insn_end: end,
+            callees,
+            callers: Vec::new(),
+            interest: 0,
+            cluster_id: 0,
+            cluster_label: String::new(),
+        });
+    }
+
+    // Fill callers from call sites.
+    let start_set: BTreeSet<u64> = functions.iter().map(|f| f.start).collect();
+    for f in &mut functions {
+        let mut callers = Vec::new();
+        for line in instructions.iter() {
+            if line.flow == FlowKind::Call && line.branch_target == Some(f.start) {
+                callers.push(line.address);
+            }
+        }
+        callers.sort_unstable();
+        callers.dedup();
+        f.callers = callers;
+        // Drop callees outside known functions (already filtered) — keep only known starts
+        f.callees.retain(|c| start_set.contains(c));
+    }
+
+    functions.sort_by_key(|f| f.start);
+    functions
+}
+
+/// Score functions for analyst interest (higher = look here first).
+fn rank_functions(
+    instructions: &[DisasmLine],
+    functions: &mut [FunctionInfo],
+    strings: &[ExtractedString],
+    entry: u64,
+) {
+    for f in functions.iter_mut() {
+        let slice = &instructions[f.insn_start..=f.insn_end];
+        let mut score: u32 = 0;
+
+        let mut calls = 0u32;
+        let mut anti = 0u32;
+        for line in slice {
+            if line.flow == FlowKind::Call {
+                calls += 1;
+            }
+            if line.anti_debug {
+                anti += 1;
+            }
+        }
+
+        score += calls.min(12) * 5;
+        score += anti.min(6) * 18;
+        score += f.callees.len().min(8) as u32 * 4;
+        score += f.callers.len().min(8) as u32 * 3;
+
+        let xref_hits = strings
+            .iter()
+            .filter(|s| {
+                s.xrefs
+                    .iter()
+                    .any(|&x| x >= f.start && x <= f.end)
+            })
+            .count() as u32;
+        score += xref_hits.min(10) * 8;
+
+        if f.start == entry || f.name == "entry" {
+            score += 25;
+        }
+
+        // Tiny stubs are less interesting unless anti-debug.
+        let len = slice.len() as u32;
+        if len <= 3 && anti == 0 {
+            score = score.saturating_sub(15);
+        }
+
+        f.interest = score.min(100) as u8;
+    }
+}
+
+/// k-means over function feature vectors; labels clusters for the TUI.
+fn cluster_functions(
+    instructions: &[DisasmLine],
+    functions: &mut [FunctionInfo],
+) -> Vec<FunctionCluster> {
+    if functions.is_empty() {
+        return Vec::new();
+    }
+
+    let features: Vec<[f32; FEATURE_DIM]> = functions
+        .iter()
+        .map(|f| function_features(instructions, f))
+        .collect();
+
+    let k = choose_k(functions.len());
+    let assign = kmeans(&features, k, 25);
+
+    for (i, f) in functions.iter_mut().enumerate() {
+        f.cluster_id = assign.get(i).copied().unwrap_or(0) as u8;
+    }
+
+    let mut clusters = Vec::new();
+    for cid in 0..k {
+        let member_feats: Vec<[f32; FEATURE_DIM]> = assign
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| **a == cid)
+            .map(|(i, _)| features[i])
+            .collect();
+        let label = label_cluster(&member_feats);
+        let members: Vec<String> = functions
+            .iter()
+            .filter(|f| f.cluster_id as usize == cid)
+            .map(|f| f.name.clone())
+            .collect();
+        let size = members.len();
+        for f in functions.iter_mut().filter(|f| f.cluster_id as usize == cid) {
+            f.cluster_label = label.clone();
+        }
+        if size > 0 {
+            clusters.push(FunctionCluster {
+                id: cid as u8,
+                label,
+                members,
+                size,
+            });
+        }
+    }
+
+    clusters.sort_by_key(|c| c.id);
+    clusters
+}
+
+/// Index of the highest-interest function (for explorer auto-jump).
+pub fn most_interesting_fn(functions: &[FunctionInfo]) -> usize {
+    functions
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, f)| f.interest)
+        .map(|(i, _)| i)
+        .unwrap_or(0)
+}
+
+/// Resolve a function name for a target address, if known.
+pub fn function_name_at(functions: &[FunctionInfo], addr: u64) -> Option<&str> {
+    functions
+        .iter()
+        .find(|f| f.start == addr)
+        .map(|f| f.name.as_str())
 }
 
 fn extract_strings_with_xrefs(data: &[u8], instructions: &[DisasmLine]) -> Vec<ExtractedString> {
@@ -223,7 +539,6 @@ fn is_interesting(s: &str) -> bool {
     if s.len() < 6 || s.len() > 240 {
         return false;
     }
-    // Skip noisy PE/CRT junk
     if lower.starts_with("abcdefghijklmnopqrstuvwxyz")
         || lower.contains("runtime error")
         || lower.contains("this program cannot be run")
