@@ -2,6 +2,7 @@
 
 use crate::heuristics::ThreatScore;
 use crate::signatures::HashBundle;
+use crate::toolchain::ToolchainFinding;
 use crate::triage::formats::ParsedBinary;
 
 #[derive(Debug, Clone)]
@@ -25,6 +26,8 @@ pub struct TriageReport {
     pub threat: ThreatScore,
     pub demangled_symbols: Vec<String>,
     pub packer_hints: Vec<String>,
+    /// Source-language / compiler toolchain fingerprints, ranked by confidence.
+    pub toolchain: Vec<ToolchainFinding>,
 }
 
 /// Detect common packer/compiler fingerprints from section names & entropy.

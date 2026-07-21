@@ -14,6 +14,7 @@ pub mod iocs;
 pub mod investigate;
 pub mod secrets;
 pub mod signatures;
+pub mod toolchain;
 pub mod triage;
 pub mod util;
 

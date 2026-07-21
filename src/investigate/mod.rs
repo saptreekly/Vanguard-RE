@@ -3,16 +3,16 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use anyhow::Result;
 use crate::containment::{EmbeddedArchive, QuarantinedSample};
-use crate::crypto::{scan as scan_crypto, CryptoFinding};
-use crate::disasm::{disassemble, interesting_strings, DisasmReport, ExtractedString};
-use crate::heuristics::{capability_summary, score_imports, CapabilityTag};
-use crate::iocs::{scan_data as scan_iocs, IocKind, NetworkIoc};
-use crate::secrets::{scan as scan_secrets, SecretCandidate};
-use crate::signatures::{build_hash_bundle, scan_yara, YaraMatch};
-use crate::triage::{detect_packer_hints, parse_binary_named, TriageReport};
+use crate::crypto::{CryptoFinding, scan as scan_crypto};
+use crate::disasm::{DisasmReport, ExtractedString, disassemble, interesting_strings};
+use crate::heuristics::{CapabilityTag, capability_summary, score_imports};
+use crate::iocs::{IocKind, NetworkIoc, scan_data as scan_iocs};
+use crate::secrets::{SecretCandidate, scan as scan_secrets};
+use crate::signatures::{YaraMatch, build_hash_bundle, scan_yara};
+use crate::triage::{TriageReport, detect_packer_hints, parse_binary_named};
 use crate::util::sha256_hex;
+use anyhow::Result;
 
 #[derive(Debug, Clone)]
 pub struct ImpHashCluster {
@@ -80,6 +80,7 @@ pub fn triage_sample(sample: &QuarantinedSample, entropy_map: bool) -> Result<Tr
     let mut threat = score_imports(&binary.imports);
     let demangled_symbols = crate::disasm::demangle_symbols(&binary.symbols);
     let mut packer_hints = detect_packer_hints(&binary);
+    let toolchain = crate::toolchain::identify(&sample.data, &binary);
 
     // Raw / DOS COM: no IAT — still surface a useful verdict.
     if matches!(
@@ -109,6 +110,7 @@ pub fn triage_sample(sample: &QuarantinedSample, entropy_map: bool) -> Result<Tr
         threat,
         demangled_symbols,
         packer_hints,
+        toolchain,
     })
 }
 
@@ -126,17 +128,16 @@ pub fn investigate(
         }
     }
 
-    triage.sort_by(|a, b| b.threat.score.cmp(&a.threat.score).then(a.path.cmp(&b.path)));
+    triage.sort_by(|a, b| {
+        b.threat
+            .score
+            .cmp(&a.threat.score)
+            .then(a.path.cmp(&b.path))
+    });
 
     let ranking: Vec<_> = triage
         .iter()
-        .map(|r| {
-            (
-                r.path.clone(),
-                r.threat.score,
-                r.threat.label.clone(),
-            )
-        })
+        .map(|r| (r.path.clone(), r.threat.score, r.threat.label.clone()))
         .collect();
 
     let imphash_clusters = cluster_imphash(&triage);
@@ -177,28 +178,10 @@ pub fn investigate(
         let disasm = disassemble(&r.path, data, None, opts.disasm_count, true).ok();
         // Always extract from the full sample — do not reuse the disasm window's
         // truncated string list (packed samples bury C2 domains under noise).
-        let mut strings = {
+        let strings = {
             let all = crate::disasm::extract_strings_ranked(data, 8_000);
-            interesting_strings(&all)
+            interesting_strings(&all).into_iter().take(120).collect()
         };
-        // Surface imported DLLs even when the string table is sparse.
-        for lib in r
-            .binary
-            .imports
-            .iter()
-            .map(|i| i.library.as_str())
-            .collect::<std::collections::BTreeSet<_>>()
-        {
-            if !strings.iter().any(|s| s.value.eq_ignore_ascii_case(lib)) {
-                strings.push(ExtractedString {
-                    offset: 0,
-                    encoding: "import".into(),
-                    value: lib.to_string(),
-                    xrefs: Vec::new(),
-                });
-            }
-        }
-        strings.truncate(120);
 
         let reason = {
             let caps = capability_summary(&r.threat.capabilities);
@@ -225,11 +208,18 @@ pub fn investigate(
         // pulled up: bare IPs buried inside a bundled Tor binary are that
         // component's infrastructure, not this sample's C2, and would mislead.
         let child_prefix = format!("{}::", r.path);
-        for child in samples.iter().filter(|s| s.label.starts_with(&child_prefix)) {
+        for child in samples
+            .iter()
+            .filter(|s| s.label.starts_with(&child_prefix))
+        {
             for ioc in scan_iocs(&child.data) {
                 let hostname_class = matches!(
                     ioc.kind,
-                    IocKind::Onion | IocKind::Url | IocKind::Domain | IocKind::Email | IocKind::Bitcoin
+                    IocKind::Onion
+                        | IocKind::Url
+                        | IocKind::Domain
+                        | IocKind::Email
+                        | IocKind::Bitcoin
                 );
                 if hostname_class && !network_iocs.iter().any(|e| e.value == ioc.value) {
                     network_iocs.push(ioc);

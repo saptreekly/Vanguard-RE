@@ -2,10 +2,10 @@
 
 use std::path::Path;
 
-use anyhow::{bail, Context, Result};
-use goblin::Object;
-use super::entropy::{entropy_heatmap, section_entropy, SectionEntropy};
+use super::entropy::{SectionEntropy, entropy_heatmap, section_entropy};
 use super::report::SectionInfo;
+use anyhow::{Context, Result, bail};
+use goblin::Object;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinaryFormat {
@@ -37,6 +37,8 @@ impl std::fmt::Display for BinaryFormat {
 pub struct ParsedBinary {
     pub format: BinaryFormat,
     pub architecture: String,
+    /// Best-effort static estimate from binary headers and imported runtimes.
+    pub operating_system: OperatingSystemEstimate,
     pub entry_point: u64,
     pub is_64bit: bool,
     pub is_lib: bool,
@@ -56,6 +58,27 @@ pub struct ParsedBinary {
 pub struct ImportEntry {
     pub library: String,
     pub function: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct OperatingSystemEstimate {
+    pub family: String,
+    pub minimum_version: Option<String>,
+    pub environment: Option<String>,
+    pub evidence: String,
+}
+
+impl OperatingSystemEstimate {
+    pub fn display(&self) -> String {
+        let mut value = self.family.clone();
+        if let Some(version) = &self.minimum_version {
+            value.push_str(&format!(" ≥ {version}"));
+        }
+        if let Some(environment) = &self.environment {
+            value.push_str(&format!(" · {environment}"));
+        }
+        value
+    }
 }
 
 pub fn detect_format(data: &[u8]) -> BinaryFormat {
@@ -96,7 +119,12 @@ pub fn parse_binary_named(
         Ok(Object::Mach(mach)) => parse_mach(data, mach, with_entropy_map),
         Ok(Object::Archive(_)) => {
             // Prefer a usable raw fallback over hard-failing the whole investigation.
-            Ok(parse_raw_blob(data, with_entropy_map, BinaryFormat::Raw, "archive"))
+            Ok(parse_raw_blob(
+                data,
+                with_entropy_map,
+                BinaryFormat::Raw,
+                "archive",
+            ))
         }
         Ok(Object::Unknown(_)) | Ok(_) | Err(_) => {
             Ok(classify_and_parse_raw(data, with_entropy_map, name_hint))
@@ -123,7 +151,8 @@ fn classify_raw(data: &[u8], name_hint: Option<&str>) -> (BinaryFormat, &'static
     });
 
     // Classic DOS COM: no MZ, ≤ 64KiB, executable-looking start (or .com name).
-    if !data.is_empty() && data.len() <= 65535 && (looks_com_name || looks_like_com_prologue(data)) {
+    if !data.is_empty() && data.len() <= 65535 && (looks_com_name || looks_like_com_prologue(data))
+    {
         return (BinaryFormat::DosCom, "x86-16");
     }
 
@@ -148,12 +177,7 @@ fn looks_like_com_prologue(data: &[u8]) -> bool {
     )
 }
 
-fn parse_raw_blob(
-    data: &[u8],
-    with_map: bool,
-    format: BinaryFormat,
-    arch: &str,
-) -> ParsedBinary {
+fn parse_raw_blob(data: &[u8], with_map: bool, format: BinaryFormat, arch: &str) -> ParsedBinary {
     let ent = section_entropy("blob", data);
     let mut entropy_maps = Vec::new();
     if with_map {
@@ -162,6 +186,20 @@ fn parse_raw_blob(
     ParsedBinary {
         format,
         architecture: arch.into(),
+        operating_system: OperatingSystemEstimate {
+            family: if format == BinaryFormat::DosCom {
+                "DOS".into()
+            } else {
+                "Unknown".into()
+            },
+            minimum_version: None,
+            environment: None,
+            evidence: if format == BinaryFormat::DosCom {
+                "DOS COM format".into()
+            } else {
+                "no recognized executable header".into()
+            },
+        },
         entry_point: 0,
         is_64bit: false,
         is_lib: false,
@@ -221,7 +259,11 @@ fn parse_pe(data: &[u8], pe: goblin::pe::PE<'_>, with_map: bool) -> Result<Parse
         });
     }
 
-    let exports: Vec<String> = pe.exports.iter().filter_map(|e| e.name.map(|n| n.to_string())).collect();
+    let exports: Vec<String> = pe
+        .exports
+        .iter()
+        .filter_map(|e| e.name.map(|n| n.to_string()))
+        .collect();
 
     let compile_timestamp = pe.header.coff_header.time_date_stamp.pipe_nonzero();
 
@@ -231,6 +273,7 @@ fn parse_pe(data: &[u8], pe: goblin::pe::PE<'_>, with_map: bool) -> Result<Parse
             .map(|d| d.size > 0)
             .unwrap_or(false)
     });
+    let operating_system = pe_os_estimate(pe.header.optional_header.as_ref());
 
     Ok(ParsedBinary {
         format: BinaryFormat::Pe,
@@ -239,6 +282,7 @@ fn parse_pe(data: &[u8], pe: goblin::pe::PE<'_>, with_map: bool) -> Result<Parse
         } else {
             "x86".into()
         },
+        operating_system,
         entry_point: pe.entry as u64,
         is_64bit: pe.is_64,
         is_lib: pe.is_lib,
@@ -252,6 +296,55 @@ fn parse_pe(data: &[u8], pe: goblin::pe::PE<'_>, with_map: bool) -> Result<Parse
         section_entropies,
         entropy_maps,
     })
+}
+
+fn pe_os_estimate(
+    optional_header: Option<&goblin::pe::optional_header::OptionalHeader>,
+) -> OperatingSystemEstimate {
+    use goblin::pe::subsystem;
+
+    let Some(header) = optional_header else {
+        return OperatingSystemEstimate {
+            family: "Windows".into(),
+            minimum_version: None,
+            environment: None,
+            evidence: "PE format; optional header unavailable".into(),
+        };
+    };
+    let fields = &header.windows_fields;
+    let (family, environment) = match fields.subsystem {
+        subsystem::IMAGE_SUBSYSTEM_NATIVE => ("Windows", Some("native / driver")),
+        subsystem::IMAGE_SUBSYSTEM_WINDOWS_GUI => ("Windows", Some("GUI")),
+        subsystem::IMAGE_SUBSYSTEM_WINDOWS_CUI => ("Windows", Some("console")),
+        subsystem::IMAGE_SUBSYSTEM_OS2_CUI => ("OS/2", Some("console")),
+        subsystem::IMAGE_SUBSYSTEM_POSIX_CUI => ("Windows", Some("POSIX console")),
+        subsystem::IMAGE_SUBSYSTEM_WINDOWS_CE_GUI => ("Windows CE", Some("GUI")),
+        subsystem::IMAGE_SUBSYSTEM_EFI_APPLICATION => ("UEFI", Some("application")),
+        subsystem::IMAGE_SUBSYSTEM_EFI_BOOT_SERVICE_DRIVER => ("UEFI", Some("boot driver")),
+        subsystem::IMAGE_SUBSYSTEM_EFI_RUNTIME_DRIVER => ("UEFI", Some("runtime driver")),
+        subsystem::IMAGE_SUBSYSTEM_EFI_ROM => ("UEFI", Some("ROM image")),
+        subsystem::IMAGE_SUBSYSTEM_XBOX => ("Xbox", None),
+        subsystem::IMAGE_SUBSYSTEM_WINDOWS_BOOT_APPLICATION => {
+            ("Windows", Some("boot application"))
+        }
+        _ => ("Windows", None),
+    };
+    let minimum_version =
+        (fields.major_subsystem_version != 0 || fields.minor_subsystem_version != 0).then(|| {
+            format!(
+                "{}.{}",
+                fields.major_subsystem_version, fields.minor_subsystem_version
+            )
+        });
+    OperatingSystemEstimate {
+        family: family.into(),
+        minimum_version,
+        environment: environment.map(str::to_string),
+        evidence: format!(
+            "PE subsystem {} and linker subsystem version",
+            fields.subsystem
+        ),
+    }
 }
 
 trait PipeNonZero {
@@ -345,10 +438,13 @@ fn parse_elf(data: &[u8], elf: goblin::elf::Elf<'_>, with_map: bool) -> Result<P
         goblin::elf::header::EM_MIPS => "mips",
         _ => "unknown",
     };
+    let operating_system =
+        elf_os_estimate(elf.header.e_ident[goblin::elf::header::EI_OSABI], &imports);
 
     Ok(ParsedBinary {
         format: BinaryFormat::Elf,
         architecture: arch.into(),
+        operating_system,
         entry_point: elf.entry,
         is_64bit: elf.is_64,
         is_lib: elf.header.e_type == goblin::elf::header::ET_DYN,
@@ -364,11 +460,45 @@ fn parse_elf(data: &[u8], elf: goblin::elf::Elf<'_>, with_map: bool) -> Result<P
     })
 }
 
-fn parse_mach(
-    data: &[u8],
-    mach: goblin::mach::Mach<'_>,
-    with_map: bool,
-) -> Result<ParsedBinary> {
+fn elf_os_estimate(osabi: u8, imports: &[ImportEntry]) -> OperatingSystemEstimate {
+    use goblin::elf::header::*;
+
+    let has_linux_runtime = imports.iter().any(|import| {
+        let library = import.library.to_ascii_lowercase();
+        library.contains("linux")
+            || library.starts_with("libc.so")
+            || library.starts_with("libpthread.so")
+            || library.starts_with("libdl.so")
+    });
+    let family = match osabi {
+        ELFOSABI_HPUX => "HP-UX",
+        ELFOSABI_NETBSD => "NetBSD",
+        ELFOSABI_GNU => "Linux / GNU",
+        ELFOSABI_SOLARIS => "Solaris",
+        ELFOSABI_AIX => "AIX",
+        ELFOSABI_IRIX => "IRIX",
+        ELFOSABI_FREEBSD => "FreeBSD",
+        ELFOSABI_TRU64 => "Tru64",
+        ELFOSABI_OPENBSD => "OpenBSD",
+        ELFOSABI_ARM_AEABI | ELFOSABI_ARM => "ARM (OS unspecified)",
+        ELFOSABI_STANDALONE => "Standalone",
+        ELFOSABI_NONE if has_linux_runtime => "Linux",
+        ELFOSABI_NONE => "Unix / System V",
+        _ => "Unix-like (unknown ABI)",
+    };
+    OperatingSystemEstimate {
+        family: family.into(),
+        minimum_version: None,
+        environment: None,
+        evidence: if osabi == ELFOSABI_NONE && has_linux_runtime {
+            "ELF System V ABI with Linux runtime imports".into()
+        } else {
+            format!("ELF OSABI {osabi}")
+        },
+    }
+}
+
+fn parse_mach(data: &[u8], mach: goblin::mach::Mach<'_>, with_map: bool) -> Result<ParsedBinary> {
     use goblin::mach::constants::cputype::{CPU_TYPE_ARM64, CPU_TYPE_X86_64};
     use goblin::mach::{Mach, SingleArch};
 
@@ -384,10 +514,13 @@ fn parse_mach(
                 CPU_TYPE_X86_64,
             ];
 
-            let arches = multi.arches().context("read Mach-O fat architecture table")?;
+            let arches = multi
+                .arches()
+                .context("read Mach-O fat architecture table")?;
             let mut index = arches.iter().position(|a| prefer.contains(&a.cputype));
             if index.is_none() {
-                index = (0..multi.narches).find(|&i| matches!(multi.get(i), Ok(SingleArch::MachO(_))));
+                index =
+                    (0..multi.narches).find(|&i| matches!(multi.get(i), Ok(SingleArch::MachO(_))));
             }
             let i = index.ok_or_else(|| {
                 anyhow::anyhow!("Mach-O fat binary has no usable architecture slice")
@@ -476,10 +609,12 @@ fn parse_macho(
         goblin::mach::constants::cputype::CPU_TYPE_ARM => "arm",
         _ => "unknown",
     };
+    let operating_system = macho_os_estimate(&macho);
 
     Ok(ParsedBinary {
         format: BinaryFormat::MachO,
         architecture: arch.into(),
+        operating_system,
         entry_point: macho.entry,
         is_64bit,
         is_lib: false,
@@ -495,3 +630,74 @@ fn parse_macho(
     })
 }
 
+fn macho_os_estimate(macho: &goblin::mach::MachO<'_>) -> OperatingSystemEstimate {
+    use goblin::mach::load_command::CommandVariant;
+
+    let mut family = "Apple platform".to_string();
+    let mut minimum_version = None;
+    let mut evidence = "Mach-O format".to_string();
+    for command in &macho.load_commands {
+        let (platform, encoded) = match command.command {
+            CommandVariant::VersionMinMacosx(v) => ("macOS", Some(v.version)),
+            CommandVariant::VersionMinIphoneos(v) => ("iOS", Some(v.version)),
+            CommandVariant::VersionMinTvos(v) => ("tvOS", Some(v.version)),
+            CommandVariant::VersionMinWatchos(v) => ("watchOS", Some(v.version)),
+            CommandVariant::BuildVersion(v) => (
+                match v.platform {
+                    1 => "macOS",
+                    2 => "iOS",
+                    3 => "tvOS",
+                    4 => "watchOS",
+                    6 => "macCatalyst",
+                    7 => "iOS Simulator",
+                    8 => "tvOS Simulator",
+                    9 => "watchOS Simulator",
+                    _ => "Apple platform",
+                },
+                Some(v.minos),
+            ),
+            _ => continue,
+        };
+        family = platform.into();
+        minimum_version = encoded.map(format_macho_version);
+        evidence = "Mach-O minimum-version load command".into();
+        break;
+    }
+    OperatingSystemEstimate {
+        family,
+        minimum_version,
+        environment: None,
+        evidence,
+    }
+}
+
+fn format_macho_version(version: u32) -> String {
+    format!(
+        "{}.{}.{}",
+        version >> 16,
+        (version >> 8) & 0xff,
+        version & 0xff
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn formats_macho_packed_version() {
+        assert_eq!(format_macho_version(0x000d_0201), "13.2.1");
+    }
+
+    #[test]
+    fn infers_linux_from_system_v_runtime_imports() {
+        let estimate = elf_os_estimate(
+            goblin::elf::header::ELFOSABI_NONE,
+            &[ImportEntry {
+                library: "libc.so.6".into(),
+                function: "socket".into(),
+            }],
+        );
+        assert_eq!(estimate.family, "Linux");
+    }
+}

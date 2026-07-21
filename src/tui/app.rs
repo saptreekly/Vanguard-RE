@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 
 use vanguard_re::containment::collect_samples;
 use vanguard_re::disasm::FlowKind;
-use vanguard_re::investigate::{investigate, InvestigateOptions, InvestigationReport};
+use vanguard_re::investigate::{InvestigateOptions, InvestigationReport, investigate};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -29,6 +29,13 @@ pub enum FormField {
 pub enum DisasmFocus {
     Functions,
     Listing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DeepDiveTab {
+    #[default]
+    Findings,
+    Imports,
 }
 
 #[derive(Debug, Clone)]
@@ -58,6 +65,7 @@ pub struct App {
     pub results_index: usize,
     pub results_scroll: usize,
     pub deep_index: Option<usize>,
+    pub deep_tab: DeepDiveTab,
     pub pending_run: bool,
     pub disasm_nav: Option<DisasmNav>,
 }
@@ -78,17 +86,14 @@ impl App {
             results_index: 0,
             results_scroll: 0,
             deep_index: None,
+            deep_tab: DeepDiveTab::Findings,
             pending_run: false,
             disasm_nav: None,
         }
     }
 
     pub fn menu_items() -> &'static [&'static str] {
-        &[
-            "Investigate sample / ZIP",
-            "About & containment",
-            "Quit",
-        ]
+        &["Investigate sample / ZIP", "About & containment", "Quit"]
     }
 
     pub fn menu_len(&self) -> usize {
@@ -127,6 +132,7 @@ impl App {
     pub fn back_to_menu(&mut self) {
         self.screen = Screen::Menu;
         self.deep_index = None;
+        self.deep_tab = DeepDiveTab::Findings;
         self.disasm_nav = None;
         self.error.clear();
         self.status.clear();
@@ -238,6 +244,7 @@ impl App {
                 self.results_index = 0;
                 self.results_scroll = 0;
                 self.deep_index = None;
+                self.deep_tab = DeepDiveTab::Findings;
                 self.disasm_nav = None;
                 self.screen = Screen::Results;
                 self.status.clear();
@@ -298,7 +305,10 @@ impl App {
         let Some(report) = &self.report else {
             return;
         };
-        let selected = report.ranking.get(self.results_index).map(|(p, _, _)| p.clone());
+        let selected = report
+            .ranking
+            .get(self.results_index)
+            .map(|(p, _, _)| p.clone());
         let Some(path) = selected else {
             return;
         };
@@ -307,11 +317,23 @@ impl App {
         } else if !report.deep_dives.is_empty() {
             self.deep_index = Some(0);
         }
+        self.deep_tab = DeepDiveTab::Findings;
     }
 
     pub fn back_to_results_list(&mut self) {
         self.deep_index = None;
+        self.deep_tab = DeepDiveTab::Findings;
         self.disasm_nav = None;
+    }
+
+    pub fn cycle_deep_dive_tab(&mut self, backwards: bool) {
+        if self.deep_index.is_none() {
+            return;
+        }
+        self.deep_tab = match (self.deep_tab, backwards) {
+            (DeepDiveTab::Findings, false) | (DeepDiveTab::Findings, true) => DeepDiveTab::Imports,
+            (DeepDiveTab::Imports, false) | (DeepDiveTab::Imports, true) => DeepDiveTab::Findings,
+        };
     }
 
     pub fn open_disasm_explorer(&mut self) {
@@ -455,7 +477,8 @@ impl App {
                     return;
                 }
                 let pos = visible.iter().position(|&i| i == fn_index).unwrap_or(0);
-                let next_pos = (pos as isize + delta).clamp(0, (visible.len() - 1) as isize) as usize;
+                let next_pos =
+                    (pos as isize + delta).clamp(0, (visible.len() - 1) as isize) as usize;
                 if let Some(nav) = &mut self.disasm_nav {
                     nav.fn_index = visible[next_pos];
                     nav.insn_cursor = 0;
@@ -502,12 +525,8 @@ impl App {
         if visible.is_empty() {
             return;
         }
-        let pos = visible
-            .iter()
-            .position(|&i| i == nav.fn_index)
-            .unwrap_or(0);
-        let next_pos =
-            (pos as isize + delta).clamp(0, (visible.len() - 1) as isize) as usize;
+        let pos = visible.iter().position(|&i| i == nav.fn_index).unwrap_or(0);
+        let next_pos = (pos as isize + delta).clamp(0, (visible.len() - 1) as isize) as usize;
         if let Some(nav) = &mut self.disasm_nav {
             nav.fn_index = visible[next_pos];
             nav.insn_cursor = 0;

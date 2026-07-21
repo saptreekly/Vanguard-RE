@@ -3,17 +3,17 @@
 mod app;
 mod ui;
 
-use std::io::{stdout, Stdout};
+use std::io::{Stdout, stdout};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
 
 use app::{App, Screen};
 
@@ -119,6 +119,8 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
                 }
                 KeyCode::Up | KeyCode::Char('k') => app.results_up(),
                 KeyCode::Down | KeyCode::Char('j') => app.results_down(),
+                KeyCode::Tab => app.cycle_deep_dive_tab(false),
+                KeyCode::BackTab => app.cycle_deep_dive_tab(true),
                 KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => app.open_deep_dive(),
                 KeyCode::Char('d') => {
                     if app.deep_index.is_some() {

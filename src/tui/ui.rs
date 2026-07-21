@@ -1,15 +1,15 @@
+use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
-use ratatui::Frame;
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Tabs, Wrap};
 
-use vanguard_re::containment::{containment_policy, EmbeddedArchive};
+use vanguard_re::containment::{EmbeddedArchive, containment_policy};
 use vanguard_re::disasm::TokenKind;
 use vanguard_re::investigate::short_name;
 use vanguard_re::secrets::SecretCandidate;
 
-use super::app::{App, DisasmFocus, FormField, Screen};
+use super::app::{App, DeepDiveTab, DisasmFocus, FormField, Screen};
 
 const ACCENT: Color = Color::Cyan;
 const WARN: Color = Color::Yellow;
@@ -73,10 +73,7 @@ fn token_style(kind: TokenKind) -> Style {
 }
 
 /// Instruction text as colored spans (red override for anti-debug lines).
-fn insn_spans(
-    tokens: &[(String, TokenKind)],
-    anti_debug: bool,
-) -> Vec<Span<'static>> {
+fn insn_spans(tokens: &[(String, TokenKind)], anti_debug: bool) -> Vec<Span<'static>> {
     if anti_debug {
         return vec![Span::styled(
             tokens.iter().map(|(t, _)| t.as_str()).collect::<String>(),
@@ -105,9 +102,7 @@ fn window(len: usize, cursor: usize, visible: usize) -> std::ops::Range<usize> {
         return 0..0;
     }
     let visible = visible.min(len);
-    let start = cursor
-        .saturating_sub(visible / 2)
-        .min(len - visible);
+    let start = cursor.saturating_sub(visible / 2).min(len - visible);
     start..start + visible
 }
 
@@ -189,7 +184,12 @@ fn draw_menu(frame: &mut Frame<'_>, app: &App, area: Rect) {
     frame.render_widget(list, chunks[1]);
 
     frame.render_widget(
-        help_bar(&[("↑↓/jk", "move"), ("enter", "select"), ("1-9", "jump"), ("q", "quit")]),
+        help_bar(&[
+            ("↑↓/jk", "move"),
+            ("enter", "select"),
+            ("1-9", "jump"),
+            ("q", "quit"),
+        ]),
         chunks[2],
     );
 }
@@ -209,9 +209,10 @@ fn draw_form(frame: &mut Frame<'_>, app: &App, area: Rect) {
         ])
         .split(col);
 
-    let header = Paragraph::new("Investigate — decrypt ZIPs into RAM, triage, signatures, deep-dive")
-        .style(Style::default().fg(FG))
-        .block(title_block("investigate"));
+    let header =
+        Paragraph::new("Investigate — decrypt ZIPs into RAM, triage, signatures, deep-dive")
+            .style(Style::default().fg(FG))
+            .block(title_block("investigate"));
     frame.render_widget(header, chunks[0]);
 
     frame.render_widget(
@@ -255,13 +256,15 @@ fn draw_form(frame: &mut Frame<'_>, app: &App, area: Rect) {
         run_style,
     )))
     .alignment(Alignment::Center)
-    .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(
-        if app.form_field == FormField::Run {
-            ACCENT
-        } else {
-            MUTED
-        },
-    )));
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(if app.form_field == FormField::Run {
+                ACCENT
+            } else {
+                MUTED
+            })),
+    );
     frame.render_widget(run, chunks[4]);
 
     let tip = Paragraph::new(vec![
@@ -275,15 +278,15 @@ fn draw_form(frame: &mut Frame<'_>, app: &App, area: Rect) {
         )),
     ])
     .wrap(Wrap { trim: true })
-    .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(MUTED)));
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(MUTED)),
+    );
     frame.render_widget(tip, chunks[5]);
 
     frame.render_widget(
-        help_bar(&[
-            ("tab/↑↓", "fields"),
-            ("enter", "run"),
-            ("esc", "menu"),
-        ]),
+        help_bar(&[("tab/↑↓", "fields"), ("enter", "run"), ("esc", "menu")]),
         chunks[6],
     );
 }
@@ -311,7 +314,9 @@ fn field<'a>(label: &'a str, value: &'a str, focused: bool, secret: bool) -> Par
     if focused {
         spans.push(Span::styled(
             "▏",
-            Style::default().fg(ACCENT).add_modifier(Modifier::SLOW_BLINK),
+            Style::default()
+                .fg(ACCENT)
+                .add_modifier(Modifier::SLOW_BLINK),
         ));
     }
     Paragraph::new(Line::from(spans)).block(
@@ -504,7 +509,11 @@ fn draw_ranking(
     let title = if len == 0 {
         "ranking".to_string()
     } else {
-        format!("ranking {}/{}  ·  enter = deep-dive", app.results_index + 1, len)
+        format!(
+            "ranking {}/{}  ·  enter = deep-dive",
+            app.results_index + 1,
+            len
+        )
     };
     frame.render_widget(List::new(items).block(title_block(&title)), area);
 }
@@ -670,6 +679,16 @@ fn draw_deep_dive(frame: &mut Frame<'_>, app: &App, area: Rect, di: usize) {
             ),
             Style::default().fg(FG),
         ));
+        left_lines.push(kv(
+            "OS est.",
+            truncate(&t.binary.operating_system.display(), left_val_w),
+            Style::default().fg(Color::LightCyan),
+        ));
+        left_lines.push(kv(
+            "",
+            truncate(&t.binary.operating_system.evidence, left_val_w),
+            Style::default().fg(MUTED),
+        ));
     }
     left_lines.push(kv(
         "sha256",
@@ -689,6 +708,26 @@ fn draw_deep_dive(frame: &mut Frame<'_>, app: &App, area: Rect, di: usize) {
                 "packer",
                 truncate(hint, left_val_w),
                 Style::default().fg(WARN),
+            ));
+        }
+    }
+    // Source language / compiler toolchain (top finding + its artifacts).
+    if let Some(top) = triage.and_then(|t| t.toolchain.first()) {
+        left_lines.push(kv(
+            "lang",
+            truncate(
+                &format!("{}  ({}%)", top.language, top.confidence),
+                left_val_w,
+            ),
+            Style::default()
+                .fg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+        if !top.evidence.is_empty() {
+            left_lines.push(kv(
+                "",
+                truncate(&top.evidence.join(", "), left_val_w),
+                Style::default().fg(MUTED),
             ));
         }
     }
@@ -757,7 +796,11 @@ fn draw_deep_dive(frame: &mut Frame<'_>, app: &App, area: Rect, di: usize) {
         none("(no builtin hits)")
     } else {
         (
-            dive.yara.iter().map(|y| y.rule.as_str()).collect::<Vec<_>>().join(" · "),
+            dive.yara
+                .iter()
+                .map(|y| y.rule.as_str())
+                .collect::<Vec<_>>()
+                .join(" · "),
             Style::default().fg(WARN),
         )
     };
@@ -767,7 +810,11 @@ fn draw_deep_dive(frame: &mut Frame<'_>, app: &App, area: Rect, di: usize) {
         none("(none detected)")
     } else {
         (
-            dive.crypto.iter().map(|c| c.name.as_str()).collect::<Vec<_>>().join(" · "),
+            dive.crypto
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>()
+                .join(" · "),
             Style::default().fg(Color::LightGreen),
         )
     };
@@ -776,7 +823,11 @@ fn draw_deep_dive(frame: &mut Frame<'_>, app: &App, area: Rect, di: usize) {
     // Techniques were previously shown atop the (now removed) disasm panel.
     let (tv, ts) = match &dive.disasm {
         Some(d) if !d.insights.is_empty() => (
-            d.insights.iter().map(|i| i.id.as_str()).collect::<Vec<_>>().join(" · "),
+            d.insights
+                .iter()
+                .map(|i| i.id.as_str())
+                .collect::<Vec<_>>()
+                .join(" · "),
             Style::default().fg(BAD),
         ),
         Some(_) => none("(none flagged)"),
@@ -787,25 +838,31 @@ fn draw_deep_dive(frame: &mut Frame<'_>, app: &App, area: Rect, di: usize) {
     // Each row is pre-truncated to one line, so the panel height is exact.
     let meta_h = (left_lines.len().max(right_lines.len()) as u16 + 2).clamp(8, 14);
 
-    // —— optional content-sized rows: possible secrets, embedded archives ——
+    // —— optional content-sized rows on the findings tab ——
+    let findings_selected = app.deep_tab == DeepDiveTab::Findings;
     let sec_lines = secret_lines(&dive.secrets, inner_w);
-    let sec_h: u16 = if sec_lines.is_empty() {
+    let sec_h: u16 = if !findings_selected || sec_lines.is_empty() {
         0
     } else {
         (sec_lines.len() as u16 + 2).min(9)
     };
     let emb_lines = embedded_archive_lines(&dive.embedded_archives, inner_w);
-    let emb_h: u16 = if emb_lines.is_empty() {
+    let emb_h: u16 = if !findings_selected || emb_lines.is_empty() {
         0
     } else {
         (emb_lines.len() as u16 + 2).min(14)
     };
 
-    // Layout: identity/signals · strings+IOCs (fills) · [secrets] · [embedded]
-    //         · disasm hint · help. Optional rows collapse when empty.
-    let mut constraints = vec![Constraint::Length(meta_h), Constraint::Min(6)];
-    let content_idx = 1usize;
-    let mut next = 2usize;
+    // Layout: identity/signals · tabs · selected content · optional findings
+    //         · disasm hint · help.
+    let mut constraints = vec![
+        Constraint::Length(meta_h),
+        Constraint::Length(3),
+        Constraint::Min(6),
+    ];
+    let tabs_idx = 1usize;
+    let content_idx = 2usize;
+    let mut next = 3usize;
     let sec_idx = if sec_h > 0 {
         constraints.push(Constraint::Length(sec_h));
         let i = next;
@@ -849,52 +906,35 @@ fn draw_deep_dive(frame: &mut Frame<'_>, app: &App, area: Rect, di: usize) {
         detail_cols[1],
     );
 
-    // —— interesting strings + network IOCs fill the freed vertical space ——
-    let row_cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(chunks[content_idx]);
-    let str_w = (row_cols[0].width as usize).saturating_sub(2);
-    let ioc_w = (row_cols[1].width as usize).saturating_sub(2);
-    let list_cap = (chunks[content_idx].height as usize).saturating_sub(2);
-    let shown_strings = dive.interesting_strings.len().min(list_cap);
-    let shown_iocs = dive.network_iocs.len().min(list_cap);
+    let import_count = triage.map(|t| t.binary.imports.len()).unwrap_or(0);
+    frame.render_widget(
+        Tabs::new(vec![
+            Line::from(" Findings "),
+            Line::from(format!(" Imports & dependencies ({import_count}) ")),
+        ])
+        .select(match app.deep_tab {
+            DeepDiveTab::Findings => 0,
+            DeepDiveTab::Imports => 1,
+        })
+        .style(Style::default().fg(MUTED))
+        .highlight_style(
+            Style::default()
+                .fg(ACCENT)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        )
+        .divider(Span::styled(" │ ", Style::default().fg(MUTED)))
+        .block(title_block("analysis")),
+        chunks[tabs_idx],
+    );
 
-    let mut string_lines = Vec::new();
-    if dive.interesting_strings.is_empty() {
-        string_lines.push(Line::from(Span::styled(
-            "  (none flagged)",
-            Style::default().fg(MUTED),
-        )));
-    } else {
-        for s in dive.interesting_strings.iter().take(shown_strings) {
-            string_lines.push(Line::from(vec![
-                Span::styled(format!(" {:>7x}  ", s.offset), Style::default().fg(MUTED)),
-                Span::styled(
-                    truncate(&s.value, str_w.saturating_sub(11)),
-                    Style::default().fg(FG),
-                ),
-            ]));
+    match app.deep_tab {
+        DeepDiveTab::Findings => {
+            draw_findings_tab(frame, dive, chunks[content_idx]);
+        }
+        DeepDiveTab::Imports => {
+            draw_imports_tab(frame, triage, chunks[content_idx]);
         }
     }
-    frame.render_widget(
-        Paragraph::new(string_lines).block(title_block(&format!(
-            "interesting strings ({}/{})",
-            shown_strings,
-            dive.interesting_strings.len()
-        ))),
-        row_cols[0],
-    );
-
-    frame.render_widget(
-        Paragraph::new(ioc_lines(&dive.network_iocs, shown_iocs, ioc_w))
-            .block(title_block(&format!(
-                "network IOCs ({}/{})",
-                shown_iocs,
-                dive.network_iocs.len()
-            ))),
-        row_cols[1],
-    );
 
     if let Some(idx) = sec_idx {
         frame.render_widget(
@@ -937,10 +977,136 @@ fn draw_deep_dive(frame: &mut Frame<'_>, app: &App, area: Rect, di: usize) {
     frame.render_widget(
         help_bar(&[
             ("↑↓", "next deep-dive"),
+            ("tab", "analysis tab"),
             ("d/enter", "function map"),
             ("b/esc", "ranking"),
         ]),
         chunks[help_idx],
+    );
+}
+
+fn draw_findings_tab(frame: &mut Frame<'_>, dive: &vanguard_re::investigate::DeepDive, area: Rect) {
+    let row_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+    let str_w = (row_cols[0].width as usize).saturating_sub(2);
+    let ioc_w = (row_cols[1].width as usize).saturating_sub(2);
+    let list_cap = (area.height as usize).saturating_sub(2);
+    let shown_strings = dive.interesting_strings.len().min(list_cap);
+    let shown_iocs = dive.network_iocs.len().min(list_cap);
+
+    let mut string_lines = Vec::new();
+    if dive.interesting_strings.is_empty() {
+        string_lines.push(Line::from(Span::styled(
+            "  (none flagged)",
+            Style::default().fg(MUTED),
+        )));
+    } else {
+        for s in dive.interesting_strings.iter().take(shown_strings) {
+            string_lines.push(Line::from(vec![
+                Span::styled(format!(" {:>7x}  ", s.offset), Style::default().fg(MUTED)),
+                Span::styled(
+                    truncate(&s.value, str_w.saturating_sub(11)),
+                    Style::default().fg(FG),
+                ),
+            ]));
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(string_lines).block(title_block(&format!(
+            "interesting strings ({shown_strings}/{})",
+            dive.interesting_strings.len()
+        ))),
+        row_cols[0],
+    );
+    frame.render_widget(
+        Paragraph::new(ioc_lines(&dive.network_iocs, shown_iocs, ioc_w)).block(title_block(
+            &format!("network IOCs ({shown_iocs}/{})", dive.network_iocs.len()),
+        )),
+        row_cols[1],
+    );
+}
+
+fn draw_imports_tab(
+    frame: &mut Frame<'_>,
+    triage: Option<&vanguard_re::triage::TriageReport>,
+    area: Rect,
+) {
+    let Some(triage) = triage else {
+        frame.render_widget(
+            Paragraph::new("(binary metadata unavailable)")
+                .style(Style::default().fg(MUTED))
+                .block(title_block("imports & loaded dependencies")),
+            area,
+        );
+        return;
+    };
+
+    let mut grouped: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+        std::collections::BTreeMap::new();
+    for import in &triage.binary.imports {
+        grouped
+            .entry(import.library.clone())
+            .or_default()
+            .insert(import.function.clone());
+    }
+
+    let width = (area.width as usize).saturating_sub(2);
+    let cap = (area.height as usize).saturating_sub(2);
+    let mut all_lines = Vec::new();
+    for (library, functions) in &grouped {
+        all_lines.push(Line::from(Span::styled(
+            truncate(library, width.saturating_sub(2)),
+            Style::default()
+                .fg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD),
+        )));
+        let visible_functions: Vec<_> = functions
+            .iter()
+            .filter(|function| function.as_str() != "*")
+            .collect();
+        if visible_functions.is_empty() {
+            all_lines.push(Line::from(Span::styled(
+                "  loaded dependency (symbols not attributed)",
+                Style::default().fg(MUTED),
+            )));
+        } else {
+            for function in visible_functions {
+                all_lines.push(Line::from(vec![
+                    Span::styled("  └ ", Style::default().fg(MUTED)),
+                    Span::styled(
+                        truncate(function, width.saturating_sub(4)),
+                        Style::default().fg(FG),
+                    ),
+                ]));
+            }
+        }
+    }
+    if all_lines.is_empty() {
+        all_lines.push(Line::from(Span::styled(
+            "  (no static imports or dynamic dependencies found)",
+            Style::default().fg(MUTED),
+        )));
+    }
+    let total_lines = all_lines.len();
+    all_lines.truncate(cap);
+    let shown = all_lines.len();
+    let symbol_count = triage
+        .binary
+        .imports
+        .iter()
+        .filter(|import| import.function != "*")
+        .count();
+    let title = format!(
+        "imports & loaded dependencies · {} libraries · {symbol_count} symbols · {shown}/{total_lines} rows",
+        grouped.len()
+    );
+    frame.render_widget(
+        Paragraph::new(all_lines)
+            .wrap(Wrap { trim: false })
+            .block(title_block(&title)),
+        area,
     );
 }
 
@@ -958,7 +1124,11 @@ fn secret_lines(secrets: &[SecretCandidate], width: usize) -> Vec<Line<'static>>
         lines.push(Line::from(vec![
             Span::styled(format!(" {:<6}", s.kind.label()), style),
             Span::styled(
-                format!("{:<width$}", truncate(&s.value, width.saturating_sub(14)), width = width.saturating_sub(14)),
+                format!(
+                    "{:<width$}",
+                    truncate(&s.value, width.saturating_sub(14)),
+                    width = width.saturating_sub(14)
+                ),
                 Style::default().fg(Color::White),
             ),
             Span::styled(format!("  {:>3}", s.score), Style::default().fg(MUTED)),
@@ -992,7 +1162,9 @@ fn embedded_archive_lines(archives: &[EmbeddedArchive], width: usize) -> Vec<Lin
             a.extracted,
         );
         let hstyle = if a.recovered_password.is_some() {
-            Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::LightGreen)
+                .add_modifier(Modifier::BOLD)
         } else if enc > 0 && a.extracted == 0 {
             Style::default().fg(BAD).add_modifier(Modifier::BOLD)
         } else {
@@ -1019,14 +1191,12 @@ fn embedded_archive_lines(archives: &[EmbeddedArchive], width: usize) -> Vec<Lin
                 break 'outer;
             }
             let lower = m.name.to_ascii_lowercase();
-            let name_style = if lower.ends_with(".exe")
-                || lower.ends_with(".dll")
-                || lower.ends_with(".sys")
-            {
-                Style::default().fg(WARN)
-            } else {
-                Style::default().fg(FG)
-            };
+            let name_style =
+                if lower.ends_with(".exe") || lower.ends_with(".dll") || lower.ends_with(".sys") {
+                    Style::default().fg(WARN)
+                } else {
+                    Style::default().fg(FG)
+                };
             let name = truncate(&m.name, width.saturating_sub(22));
             lines.push(Line::from(vec![
                 Span::styled(
@@ -1037,7 +1207,10 @@ fn embedded_archive_lines(archives: &[EmbeddedArchive], width: usize) -> Vec<Lin
                         Style::default().fg(MUTED)
                     },
                 ),
-                Span::styled(format!("{name:<width$}", width = width.saturating_sub(22)), name_style),
+                Span::styled(
+                    format!("{name:<width$}", width = width.saturating_sub(22)),
+                    name_style,
+                ),
                 Span::styled(
                     format!("  {:>9}", human_size(m.size)),
                     Style::default().fg(MUTED),
@@ -1096,7 +1269,9 @@ fn draw_disasm_explorer(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let header = Paragraph::new(Line::from(vec![
         Span::styled(
             short_name(&dive.path),
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(" ▸ ", Style::default().fg(MUTED)),
         Span::styled(
@@ -1264,10 +1439,7 @@ fn draw_fn_pane(
         .filter(|(_, f)| nav.cluster_filter.map_or(true, |c| f.cluster_id == c))
         .map(|(i, _)| i)
         .collect();
-    let sel_pos = visible
-        .iter()
-        .position(|&i| i == nav.fn_index)
-        .unwrap_or(0);
+    let sel_pos = visible.iter().position(|&i| i == nav.fn_index).unwrap_or(0);
 
     let items: Vec<ListItem> = window(visible.len(), sel_pos, visible_h)
         .map(|pos| {
@@ -1330,12 +1502,12 @@ fn draw_about(frame: &mut Frame<'_>, area: Rect) {
         Line::from(""),
     ]
     .into_iter()
-    .chain(policy.notes.iter().map(|n| {
-        Line::from(Span::styled(
-            format!("• {n}"),
-            Style::default().fg(MUTED),
-        ))
-    }))
+    .chain(
+        policy
+            .notes
+            .iter()
+            .map(|n| Line::from(Span::styled(format!("• {n}"), Style::default().fg(MUTED)))),
+    )
     .chain([
         Line::from(""),
         Line::from(Span::styled(
