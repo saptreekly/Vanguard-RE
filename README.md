@@ -1,6 +1,6 @@
 # Vanguard-RE
 
-High-speed, memory-safe static malware triage — interactive TUI only.
+High-speed, memory-safe static malware triage from the command line.
 
 ## Three Pillars
 
@@ -14,7 +14,7 @@ High-speed, memory-safe static malware triage — interactive TUI only.
 
 ```
 ┌──────────────────────────────────────────────────┐
-│              Vanguard-RE TUI (ratatui)            │
+│              Vanguard-RE CLI (vanguard)          │
 └────────────────────────┬─────────────────────────┘
                          │
     ┌──────────┬─────────┼─────────┬──────────┐
@@ -37,7 +37,7 @@ High-speed, memory-safe static malware triage — interactive TUI only.
 | **Possible secrets** | Heuristic password / API-key candidates ranked by character-class mix, entropy band, and word-stem shape (lead generator, not proof) |
 | **Crypto** | AES / ChaCha20 / SHA / MD5 / Blowfish / PEM / Base64 / CryptoAPI imports via constant tables |
 | **Strings** | Ranked ASCII + UTF-16LE extraction (not first-N file order), ransomware / C2 keyword filter, import DLLs |
-| **Disassembly** | iced-x86 with syntax highlighting, function recovery, interest ranking, k-means clusters |
+| **Disassembly** | iced-x86 function recovery, interest ranking, k-means clusters, technique insights |
 | **Code analysis** | Automated technique flags: PEB access, API hashing, XOR loops, stack strings, direct syscalls, indirect dispatch |
 
 ## Build & install
@@ -55,40 +55,32 @@ Builtin signature rules are a lightweight string/byte matcher. External `.yar` f
 ## Usage
 
 ```bash
-vanguard
+vanguard <PATH> [--password infected] [--deep 3] [--disasm-count 4000] [--min-deep-score 70]
 ```
 
-Menu → **Investigate sample / ZIP** → paste path, set password if needed → Run.
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--password` / `-p` | `infected` | Password for encrypted ZIP archives |
+| `--deep` | `3` | Number of top-scoring samples to deep-dive |
+| `--disasm-count` | `4000` | Max instructions to decode per deep-dive |
+| `--min-deep-score` | `70` | Minimum triage score required for a deep-dive |
 
-Passworded malware packs (e.g. password `infected`) and ZIPs embedded inside binaries are decrypted into RAM only, then ranked, signature-scanned, and deep-dived in the UI.
+Examples:
 
-### Deep-dive panels
+```bash
+# Passworded malware ZIP (members stay in RAM)
+vanguard /path/to/sample.zip -p infected
 
-| Panel | Contents |
-|-------|----------|
-| **Sample** | Name, format / arch / size, estimated OS + header evidence, hashes, packer hints, source language + artifacts |
-| **Threat signals** | Risk + capability gauges, behaviors, sigs, crypto, techniques |
-| **Findings tab** | Ranked analyst-useful strings and network IOCs |
-| **Imports & dependencies tab** | DLLs, shared libraries, dylibs, and imported functions parsed from the binary |
-| **Network IOCs** | C2 candidates (domains, IPs, URLs, onion, Bitcoin wallets), merged from decrypted embedded members |
-| **Possible secrets** | Heuristic password / key candidates (verify manually) |
-| **Embedded archives** | ZIPs carved from sample bytes; member listing, encrypted-payload flag, and any recovered password |
-| **Function map** (`d`) | Interest-sorted functions, clusters, follow-call (disassembly lives here) |
+# Loose PE / ELF / Mach-O
+vanguard /path/to/malware.exe --password ""
 
-### Keys
+# Deeper disassembly budget on the top hit
+vanguard /path/to/sample.zip --deep 1 --disasm-count 8000
+```
 
-| Key | Action |
-|-----|--------|
-| ↑↓ / j k | Move / step instructions |
-| g / G / Home / End | Jump top / bottom |
-| Enter | Select / run / deep-dive / follow call |
-| Tab | Next form field / switch deep-dive tab / switch disasm pane |
-| d | Open function-map disasm explorer |
-| [ ] | Previous / next recovered function |
-| c | Cycle k-means function cluster filter |
-| u / Backspace | Back after follow-call (or leave explorer) |
-| b | Back to ranking (from deep-dive) |
-| Esc / q | Back / quit |
+Stdout reports ranking, ImpHash clusters, PE/ELF triage, then deep-dive sections (YARA, network IOCs, crypto, secrets, imports, strings, disasm insights).
+
+Passworded malware packs and ZIPs embedded inside binaries are decrypted into RAM only, then ranked, signature-scanned, and deep-dived — nothing is executed.
 
 ## Containment
 

@@ -1,50 +1,20 @@
-//! Headless driver for the Vanguard-RE analysis engine.
-//!
-//! The interactive TUI (`vanguard`) refuses to run without a real terminal, so
-//! this example exposes the exact same library pipeline (`collect_samples` +
-//! `investigate`) for non-interactive / scripted triage. Samples are only ever
-//! mapped and statically parsed — nothing is executed, matching the TUI's
-//! containment guarantees.
-//!
-//! Usage:
-//!   cargo run --release --example headless -- <path-to-sample-or-zip> [password] [deep] [disasm_count]
-//!
-//! Defaults: password "infected", deep 3, disasm_count 4000.
+use std::path::Path;
 
-use std::path::{Path, PathBuf};
+use vanguard_re::containment::QuarantinedSample;
+use vanguard_re::investigate::InvestigationReport;
 
-use vanguard_re::containment::collect_samples;
-use vanguard_re::investigate::{investigate, InvestigateOptions};
-
-fn main() -> anyhow::Result<()> {
-    let mut args = std::env::args().skip(1);
-    let target = args
-        .next()
-        .expect("usage: headless <path> [password] [deep] [disasm_count]");
-    let password = args.next().unwrap_or_else(|| "infected".to_string());
-    let deep: usize = args.next().and_then(|v| v.parse().ok()).unwrap_or(3);
-    let disasm_count: usize = args.next().and_then(|v| v.parse().ok()).unwrap_or(4000);
-
-    let path = PathBuf::from(&target);
-    let samples = collect_samples(&path, false, Some(password.as_str()))?;
-
-    println!("== VANGUARD-RE HEADLESS ==");
-    println!("source        : {}", path.display());
+/// Print the full investigation report to stdout (ranking → clusters → triage → deep dives).
+pub fn print_report(
+    path: &Path,
+    samples: &[QuarantinedSample],
+    report: &InvestigationReport,
+) {
+    println!("== VANGUARD-RE ==");
+    println!("source         : {}", path.display());
     println!("members        : {}", samples.len());
-    for s in &samples {
+    for s in samples {
         println!("  - {:<48} {} bytes", s.label, s.data.len());
     }
-
-    let report = investigate(
-        &path.display().to_string(),
-        &samples,
-        InvestigateOptions {
-            deep,
-            disasm_count,
-            yara_rules: None,
-            min_deep_score: 70,
-        },
-    )?;
 
     println!("\n== RANKING ({} samples) ==", report.sample_count);
     for (i, (name, score, label)) in report.ranking.iter().enumerate() {
@@ -198,7 +168,10 @@ fn main() -> anyhow::Result<()> {
         }
 
         if !d.interesting_strings.is_empty() {
-            println!("\n-- INTERESTING STRINGS ({}) --", d.interesting_strings.len());
+            println!(
+                "\n-- INTERESTING STRINGS ({}) --",
+                d.interesting_strings.len()
+            );
             for s in &d.interesting_strings {
                 println!(
                     "  @0x{:<8x} [{}] {}",
@@ -244,9 +217,6 @@ fn main() -> anyhow::Result<()> {
             }
         }
     }
-
-    let _ = Path::new("");
-    Ok(())
 }
 
 fn truncate(s: &str, max: usize) -> String {

@@ -15,7 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
-crossterm = "0.29"
+clap = { version = "4", features = ["derive"] }
 goblin = "0.10"
 hex = "0.4"
 iced-x86 = { version = "1", default-features = false, features = [
@@ -26,19 +26,17 @@ iced-x86 = { version = "1", default-features = false, features = [
 ] }
 md-5 = "0.10"
 memmap2 = "0.9"
-ratatui = { version = "0.30", default-features = false, features = [
-    "crossterm",
-    "layout-cache",
-    "macros",
-    "underline-color",
-] }
 sha2 = "0.10"
 walkdir = "2"
 # "deflate-flate2" gives decompress-capable deflate without the "deflate"
 # umbrella feature, which drags in zopfli (write-side compression). The direct
 # flate2 dep supplies the rust_backend feature via unification.
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
-zip = { version = "2", default-features = false, features = ["aes-crypto", "deflate-flate2", "flate2"] }
+zip = { version = "2", default-features = false, features = [
+    "aes-crypto",
+    "deflate-flate2",
+    "flate2",
+] }
 
 [profile.release]
 lto = false
