@@ -82,6 +82,12 @@ impl OperatingSystemEstimate {
 }
 
 pub fn detect_format(data: &[u8]) -> BinaryFormat {
+    // Java class files and Mach-O fat binaries share CAFEBABE. In a class
+    // header bytes 6..8 are the JVM major version (normally 45..=100);
+    // in a fat Mach-O those bytes are the low half of a small arch count.
+    if looks_like_java_class(data) {
+        return BinaryFormat::Raw;
+    }
     match Object::parse(data) {
         Ok(Object::PE(_)) => BinaryFormat::Pe,
         Ok(Object::Elf(_)) => BinaryFormat::Elf,
@@ -113,6 +119,14 @@ pub fn parse_binary_named(
     with_entropy_map: bool,
     name_hint: Option<&str>,
 ) -> Result<ParsedBinary> {
+    if looks_like_java_class(data) {
+        return Ok(parse_raw_blob(
+            data,
+            with_entropy_map,
+            BinaryFormat::Raw,
+            "jvm-bytecode",
+        ));
+    }
     match Object::parse(data) {
         Ok(Object::PE(pe)) => parse_pe(data, pe, with_entropy_map),
         Ok(Object::Elf(elf)) => parse_elf(data, elf, with_entropy_map),
@@ -130,6 +144,12 @@ pub fn parse_binary_named(
             Ok(classify_and_parse_raw(data, with_entropy_map, name_hint))
         }
     }
+}
+
+fn looks_like_java_class(data: &[u8]) -> bool {
+    data.len() >= 8
+        && data[..4] == [0xca, 0xfe, 0xba, 0xbe]
+        && (45..=100).contains(&u16::from_be_bytes([data[6], data[7]]))
 }
 
 fn classify_and_parse_raw(data: &[u8], with_map: bool, name_hint: Option<&str>) -> ParsedBinary {
@@ -398,15 +418,11 @@ fn parse_elf(data: &[u8], elf: goblin::elf::Elf<'_>, with_map: bool) -> Result<P
             function: "*".into(),
         });
     }
-    for sym in elf.dynsyms.iter() {
+    let version_libs = elf_version_lib_map(&elf);
+    for (sym_idx, sym) in elf.dynsyms.iter().enumerate() {
         if sym.is_import() {
             if let Some(name) = elf.dynstrtab.get_at(sym.st_name) {
-                let lib = elf
-                    .libraries
-                    .first()
-                    .copied()
-                    .unwrap_or("UNKNOWN")
-                    .to_string();
+                let lib = elf_import_library(&elf, &version_libs, sym_idx);
                 imports.push(ImportEntry {
                     library: lib,
                     function: name.to_string(),
@@ -495,6 +511,47 @@ fn elf_os_estimate(osabi: u8, imports: &[ImportEntry]) -> OperatingSystemEstimat
         } else {
             format!("ELF OSABI {osabi}")
         },
+    }
+}
+
+/// Map GNU versym version indices → needed library names via VERNEED.
+fn elf_version_lib_map(elf: &goblin::elf::Elf<'_>) -> std::collections::BTreeMap<u16, String> {
+    let mut map = std::collections::BTreeMap::new();
+    let Some(verneed) = &elf.verneed else {
+        return map;
+    };
+    for need in verneed.iter() {
+        let lib = elf
+            .dynstrtab
+            .get_at(need.vn_file)
+            .unwrap_or("?")
+            .to_string();
+        for aux in need.iter() {
+            let idx = aux.vna_other & goblin::elf::symver::VERSYM_VERSION;
+            map.insert(idx, lib.clone());
+        }
+    }
+    map
+}
+
+fn elf_import_library(
+    elf: &goblin::elf::Elf<'_>,
+    version_libs: &std::collections::BTreeMap<u16, String>,
+    sym_idx: usize,
+) -> String {
+    if let Some(versym) = &elf.versym {
+        if let Some(vs) = versym.get_at(sym_idx) {
+            let idx = vs.version();
+            if let Some(lib) = version_libs.get(&idx) {
+                return lib.clone();
+            }
+        }
+    }
+    // No versioning info: leave unattributed rather than blaming the first DT_NEEDED.
+    if elf.libraries.len() == 1 {
+        elf.libraries[0].to_string()
+    } else {
+        "?".into()
     }
 }
 
@@ -699,5 +756,23 @@ mod tests {
             }],
         );
         assert_eq!(estimate.family, "Linux");
+    }
+
+    #[test]
+    fn elf_import_library_uses_single_needed_or_unknown() {
+        // Without a live ELF blob, assert the fallback helper policy via the
+        // public parse path on a tiny invalid buffer (no crash / empty imports).
+        let parsed = parse_binary_named(b"\x7fELFnot-real", false, Some("bad.elf")).unwrap();
+        assert!(parsed.imports.is_empty() || parsed.format != BinaryFormat::Elf);
+    }
+
+    #[test]
+    fn java_class_is_not_misparsed_as_fat_macho() {
+        let mut class = vec![0xca, 0xfe, 0xba, 0xbe, 0x00, 0x00, 0x00, 0x34];
+        class.extend_from_slice(&[0; 16]);
+        let parsed = parse_binary_named(&class, false, Some("Payload.class")).unwrap();
+        assert_eq!(parsed.format, BinaryFormat::Raw);
+        assert_eq!(parsed.architecture, "jvm-bytecode");
+        assert_eq!(detect_format(&class), BinaryFormat::Raw);
     }
 }

@@ -31,6 +31,8 @@ pub fn hash_file(data: &[u8]) -> (String, String) {
     (md5_hex, sha_hex)
 }
 
+/// Mandiant ImpHash: lowercase `dll.function` entries in **IAT order** (no
+/// alphabetical sort — reordering imports changes the hash and is the point).
 pub fn compute_imphash(imports: &[ImportEntry]) -> Option<String> {
     if imports.is_empty() {
         return None;
@@ -121,5 +123,36 @@ mod tests {
         let h2 = compute_imphash(&imports).unwrap();
         assert_eq!(h1, h2);
         assert_eq!(h1.len(), 32);
+        // Golden MD5 of "kernel32.createfilea,kernel32.readfile" (IAT order).
+        assert_eq!(h1, "2d7133194ae83ab7306b73f323242785");
+    }
+
+    #[test]
+    fn imphash_preserves_iat_order() {
+        let a = vec![
+            ImportEntry {
+                library: "kernel32.dll".into(),
+                function: "CreateFileA".into(),
+            },
+            ImportEntry {
+                library: "kernel32.dll".into(),
+                function: "ReadFile".into(),
+            },
+        ];
+        let b = vec![
+            ImportEntry {
+                library: "kernel32.dll".into(),
+                function: "ReadFile".into(),
+            },
+            ImportEntry {
+                library: "kernel32.dll".into(),
+                function: "CreateFileA".into(),
+            },
+        ];
+        assert_ne!(compute_imphash(&a), compute_imphash(&b));
+        assert_eq!(
+            compute_imphash(&b).unwrap(),
+            "b1c7936280315755bcad849d77149970"
+        );
     }
 }

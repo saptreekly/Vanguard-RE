@@ -94,7 +94,10 @@ fn scan_lightweight(data: &[u8]) -> Vec<YaraMatch> {
             b"HttpSendRequest".as_slice(),
             b"InternetReadFile".as_slice(),
         ];
-        let n = wininet.iter().filter(|s| contains_ascii_ci(data, s)).count();
+        let n = wininet
+            .iter()
+            .filter(|s| contains_ascii_ci(data, s))
+            .count();
         if n >= 3 {
             hits.push(hit("RAT_WinINet_C2_Imports", "medium"));
         }
@@ -116,7 +119,15 @@ fn scan_lightweight(data: &[u8]) -> Vec<YaraMatch> {
             hits.push(hit("RAT_Socket_Client", "medium"));
         }
 
-        if contains_ascii_ci(data, b"CODE")
+        // Gate behind Delphi toolchain markers — bare CODE/DATA/.idata also
+        // appears in ordinary MSVC binaries and caused Conti/WannaCry FPs.
+        let delphiish = contains_ascii_ci(data, b"Embarcadero")
+            || contains_ascii_ci(data, b"Borland")
+            || contains_ascii_ci(data, b"System.pas")
+            || contains_ascii_ci(data, b"SysInit")
+            || contains_ascii_ci(data, b"TApplication");
+        if delphiish
+            && contains_ascii_ci(data, b"CODE")
             && contains_ascii_ci(data, b"DATA")
             && contains_ascii_ci(data, b".idata")
         {

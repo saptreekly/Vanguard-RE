@@ -60,9 +60,50 @@ const NOISE_HOSTS: &[&str] = &[
     "openssl.org",
 ];
 
+/// Full vendor FQDNs used to reject mid-label truncations (`osoft.com` from
+/// `microsoft.com`) without blocking unrelated short domains.
+const VENDOR_FQDNS: &[&str] = &[
+    "schemas.microsoft.com",
+    "microsoft.com",
+    "windows.com",
+    "www.w3.org",
+    "w3.org",
+    "purl.org",
+    "xmlsoap.org",
+    "apache.org",
+    "gnu.org",
+    "openssl.org",
+];
+
 fn is_noise_host(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
-    NOISE_HOSTS.iter().any(|h| lower.contains(h))
+    NOISE_HOSTS.iter().any(|h| lower.contains(h)) || is_vendor_host_fragment(&lower)
+}
+
+/// True when `host` looks like a truncated mid-label fragment of a vendor FQDN
+/// (e.g. printable-run starting at `osoft.com` inside `microsoft.com`).
+fn is_vendor_host_fragment(host: &str) -> bool {
+    let host = host.split(['/', ':', '?', '#']).next().unwrap_or(host);
+    if host.len() < 4 {
+        return false;
+    }
+    for vendor in VENDOR_FQDNS {
+        if *vendor == host {
+            return false;
+        }
+        if vendor.ends_with(host) && host.len() < vendor.len() {
+            let cut = vendor.len() - host.len();
+            // Mid-label truncation: char before the fragment is not a dot.
+            if cut > 0 && vendor.as_bytes()[cut - 1] != b'.' {
+                return true;
+            }
+        }
+        // Truncated prefix of a vendor host: `schemas.mic`
+        if vendor.starts_with(host) && host.len() < vendor.len() && host.contains('.') {
+            return true;
+        }
+    }
+    false
 }
 
 /// Extract network IOCs from raw sample bytes (ASCII + UTF-16LE strings).
@@ -137,12 +178,21 @@ fn scan_urls(text: &str, found: &mut BTreeMap<String, NetworkIoc>) {
                 continue;
             }
             let host_only = host.split(['/', ':', '?']).next().unwrap_or("");
+            if host_only.is_empty() || is_noise_host(host_only) || is_noise_host(url) {
+                continue;
+            }
             let (confidence, private) = match parse_ipv4(host_only) {
                 Some(octets) => {
                     let private = is_private(octets);
                     (if private { 40 } else { 95 }, private)
                 }
-                None => (85, false),
+                None => {
+                    // Require a plausible domain — rejects `http://schemas.mic`.
+                    if !looks_like_domain(host_only) {
+                        continue;
+                    }
+                    (85, false)
+                }
             };
             add(
                 found,
@@ -763,6 +813,19 @@ mod tests {
         assert!(
             iocs.is_empty(),
             "vendor schema URLs must not surface as C2: {iocs:?}"
+        );
+    }
+
+    #[test]
+    fn drops_truncated_vendor_host_fragments() {
+        // Mid-label printable run from "microsoft.com" / truncated schema URL.
+        let data = b"junk\0osoft.com\0http://schemas.mic\0";
+        let iocs = scan_data(data);
+        assert!(
+            iocs.iter().all(|i| {
+                !i.value.contains("osoft.com") && !i.value.contains("schemas.mic")
+            }),
+            "truncated vendor fragments must not surface: {iocs:?}"
         );
     }
 

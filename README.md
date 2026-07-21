@@ -30,8 +30,8 @@ High-speed, memory-safe static malware triage from the command line.
 |-------|---------|
 | **Triage** | PE/ELF/Mach-O headers, ImpHash, entropy / packer hints, IAT threat score, capability tags |
 | **Toolchain** | Source-language / compiler fingerprints (Go, Rust, .NET, MSVC via Rich header, GCC/MinGW, Delphi, VB6, Nim, AutoIt, PyInstaller) with the artifacts that matched |
-| **Signatures** | Lightweight builtin string/byte rules (no YARA-X / Wasmtime) |
-| **Network IOCs** | Hardcoded IPv4 / `ip:port`, URLs, domains, `.onion`, emails, checksum-validated Bitcoin wallets — ranked by confidence |
+| **Signatures** | Lightweight builtin string/byte rules (no YARA-X / Wasmtime); Delphi section rule is gated on Delphi toolchain markers |
+| **Network IOCs** | Hardcoded IPv4 / `ip:port`, URLs, domains, `.onion`, emails, checksum-validated Bitcoin wallets — ranked by confidence; vendor schema / truncated-host noise is filtered |
 | **Embedded archives** | Carves ZIP signatures from executable/resource bytes, decrypts members in memory, and recursively analyzes them with bomb limits |
 | **Credential recovery** | Cracks encrypted embedded ZIPs by trying the sample's own plaintext strings as passwords (recovers WannaCry's `WNcry@2ol7`), then unlocks + analyzes the payload |
 | **Possible secrets** | Heuristic password / API-key candidates ranked by character-class mix, entropy band, and word-stem shape (lead generator, not proof) |
@@ -39,6 +39,28 @@ High-speed, memory-safe static malware triage from the command line.
 | **Strings** | Ranked ASCII + UTF-16LE extraction (not first-N file order), ransomware / C2 keyword filter, import DLLs |
 | **Disassembly** | iced-x86 function recovery, interest ranking, k-means clusters, technique insights |
 | **Code analysis** | Automated technique flags: PEB access, API hashing, XOR loops, stack strings, direct syscalls, indirect dispatch |
+
+## Scoring & ranking
+
+Threat scores come from IAT pattern matches and capability tags. Labels are built from **evidence that actually matched** — a high score never invents “injection / hollow” prose unless those APIs are present.
+
+| Capability id | Meaning |
+|---------------|---------|
+| `injection` | Process injection / hollowing APIs |
+| `http_client` | WinINet / WinHTTP / URLDownload |
+| `socket_client` | Winsock / BSD sockets (needs ≥2 hits; `send` does not match `SendMessageA`) |
+| `smb_enum` | Share / SMB discovery (`NetShareEnum`, …) |
+| `c2_suspect` | Stronger HTTP combo (download-to-file or multi-API WinINet) |
+| `persistence` | Services, run keys, tasks |
+| `file_delete` / `file_drop` | Cleanup helpers and droppers |
+| `crypto`, `anti_debug`, `keylog`, … | As matched |
+
+Additional ranking rules:
+
+- **DOS COM** still gets a useful floor score; generic **Raw** blobs no longer auto-score 35
+- **Language packs** (`msg/m_*.wnry`, `.mui`, …), **source/build** (`.cpp`, `.tlog`, `.obj`, `.pdb`, …) are demoted so they cannot flood the ranking
+- **.NET** samples with high toolchain confidence get a managed score floor (higher when stealer-shaped strings are present) so AgentTesla-class binaries are not “benign” just because the native IAT is empty
+- **ELF / IoT bots** match a Unix socket-client pattern (`socket` + `connect` + `send`)
 
 ## Build & install
 

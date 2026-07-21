@@ -17,7 +17,7 @@ use std::fs::File;
 use std::io::{Cursor, Read, Seek};
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use walkdir::WalkDir;
 use zip::ZipArchive;
 
@@ -127,7 +127,11 @@ fn looks_like_zip_magic(path: &Path) -> Result<bool> {
     let mut f = File::open(path)?;
     let mut magic = [0u8; 4];
     let n = f.read(&mut magic)?;
-    Ok(n >= 4 && (magic == *b"PK\x03\x04" || (magic[0] == b'P' && magic[1] == b'K')))
+    // Accept only real ZIP signatures — not every `PK*` blob.
+    Ok(n >= 4
+        && (magic == *b"PK\x03\x04" // local file header
+            || magic == *b"PK\x05\x06" // empty archive EOCD
+            || magic == *b"PK\x07\x08")) // spanned archive marker
 }
 
 /// Collect analysis targets. ZIP inputs expand in-memory (password optional).
@@ -187,7 +191,10 @@ pub fn collect_samples(
 }
 
 /// Decrypt every file member of a ZIP into RAM. Never writes members to disk.
-pub fn decrypt_zip_in_memory(path: &Path, password: Option<&str>) -> Result<Vec<QuarantinedSample>> {
+pub fn decrypt_zip_in_memory(
+    path: &Path,
+    password: Option<&str>,
+) -> Result<Vec<QuarantinedSample>> {
     let file = File::open(path).with_context(|| format!("open archive {}", path.display()))?;
     let archive_label = path.display().to_string();
     extract_zip_members(file, &archive_label, password)
@@ -226,8 +233,7 @@ fn embedded_zip_ranges(data: &[u8]) -> Vec<std::ops::Range<usize>> {
             if eocd + 22 > data.len() {
                 break;
             }
-            let comment_len =
-                u16::from_le_bytes([data[eocd + 20], data[eocd + 21]]) as usize;
+            let comment_len = u16::from_le_bytes([data[eocd + 20], data[eocd + 21]]) as usize;
             let end = eocd + 22 + comment_len;
             if end <= data.len() {
                 carved = Some(start..end);
@@ -282,20 +288,17 @@ fn expand_embedded_archives(
 
                 // Best-effort decryption with the caller-supplied password first.
                 let mut recovered_password = None;
-                let mut extracted = match extract_zip_members(
-                    Cursor::new(blob),
-                    &archive_label,
-                    password,
-                ) {
-                    Ok(children) => {
-                        let n = children.len();
-                        for child in children {
-                            pending.push((child, depth + 1));
+                let mut extracted =
+                    match extract_zip_members(Cursor::new(blob), &archive_label, password) {
+                        Ok(children) => {
+                            let n = children.len();
+                            for child in children {
+                                pending.push((child, depth + 1));
+                            }
+                            n
                         }
-                        n
-                    }
-                    Err(_) => 0,
-                };
+                        Err(_) => 0,
+                    };
 
                 // If encrypted members remain locked, mount a candidate-password
                 // attack using printable strings from the *parent* sample. Many
@@ -355,13 +358,17 @@ fn list_zip_members<R: Read + Seek>(reader: R) -> Result<Vec<EmbeddedMember>> {
 }
 
 /// Maximum candidate passwords to try (bounds worst-case recovery time).
-const MAX_PASSWORD_CANDIDATES: usize = 80_000;
+const MAX_PASSWORD_CANDIDATES: usize = 2_000;
+/// Soft cap while scanning so we do not materialize every printable run in a
+/// huge binary before ranking/truncating.
+const MAX_PASSWORD_HARVEST: usize = 20_000;
 
 /// Harvest printable-ASCII tokens that could plausibly be a password/key.
 ///
 /// Passwords are contiguous non-whitespace printable runs of moderate length.
-/// We keep maximal runs (deduped, in file order) — WannaCry stores its inner
-/// ZIP password `WNcry@2ol7` as exactly such a null-terminated literal.
+/// We keep maximal runs (deduped), then rank high-signal tokens first and
+/// truncate — WannaCry stores its inner ZIP password `WNcry@2ol7` as exactly
+/// such a null-terminated literal.
 fn harvest_password_candidates(data: &[u8]) -> Vec<String> {
     const MIN: usize = 4;
     const MAX: usize = 64;
@@ -387,17 +394,43 @@ fn harvest_password_candidates(data: &[u8]) -> Vec<String> {
             (false, Some(s)) => {
                 flush(s, i, &mut out);
                 run_start = None;
-                if out.len() >= MAX_PASSWORD_CANDIDATES {
-                    return out;
+                if out.len() >= MAX_PASSWORD_HARVEST {
+                    break;
                 }
             }
             _ => {}
         }
     }
     if let Some(s) = run_start {
-        flush(s, data.len(), &mut out);
+        if out.len() < MAX_PASSWORD_HARVEST {
+            flush(s, data.len(), &mut out);
+        }
     }
+
+    out.sort_by_key(|s| password_candidate_rank(s));
+    out.truncate(MAX_PASSWORD_CANDIDATES);
     out
+}
+
+/// Lower is better: prefer medium length + mixed character classes.
+fn password_candidate_rank(s: &str) -> (u8, u8, usize) {
+    let len = s.len();
+    let len_band = if (6..=24).contains(&len) {
+        0
+    } else if (4..=40).contains(&len) {
+        1
+    } else {
+        2
+    };
+    let has_digit = s.bytes().any(|b| b.is_ascii_digit());
+    let has_special = s.bytes().any(|b| !b.is_ascii_alphanumeric());
+    let has_alpha = s.bytes().any(|b| b.is_ascii_alphabetic());
+    let class_score = match (has_alpha, has_digit, has_special) {
+        (true, true, true) => 0,
+        (true, true, false) | (true, false, true) | (false, true, true) => 1,
+        _ => 2,
+    };
+    (len_band, class_score, len)
 }
 
 /// Try each candidate as the password for an embedded ZIP.
@@ -445,11 +478,27 @@ fn extract_zip_members<R: Read + Seek>(
 ) -> Result<Vec<QuarantinedSample>> {
     let mut archive =
         ZipArchive::new(reader).with_context(|| format!("parse ZIP {archive_label}"))?;
-    if archive.len() > MAX_ARCHIVE_MEMBERS {
-        bail!(
-            "{archive_label} has {} members (limit {MAX_ARCHIVE_MEMBERS})",
-            archive.len()
+    let mut indices: Vec<(usize, u8)> = (0..archive.len())
+        .map(|i| {
+            let priority = archive
+                .by_index_raw(i)
+                .ok()
+                .map(|entry| archive_member_priority(entry.name()))
+                .unwrap_or(u8::MAX);
+            (i, priority)
+        })
+        .collect();
+    if indices.len() > MAX_ARCHIVE_MEMBERS {
+        eprintln!(
+            "{archive_label} has {} members; analyzing a prioritized subset of \
+             {MAX_ARCHIVE_MEMBERS}",
+            indices.len()
         );
+        // Prefer runnable/config/document payloads over source, symbols, and
+        // metadata while preserving archive order within each priority.
+        indices.sort_by_key(|(index, priority)| (*priority, *index));
+        indices.truncate(MAX_ARCHIVE_MEMBERS);
+        indices.sort_by_key(|(index, _)| *index);
     }
 
     let mut samples = Vec::new();
@@ -457,7 +506,7 @@ fn extract_zip_members<R: Read + Seek>(
     let mut password_failures = 0usize;
     let mut total_extracted = 0u64;
 
-    for i in 0..archive.len() {
+    for (i, _) in indices {
         // Raw metadata does not require the password.
         let (name, encrypted, is_dir, size) = {
             let meta = archive
@@ -525,7 +574,9 @@ fn extract_zip_members<R: Read + Seek>(
                 data,
             ));
         } else {
-            let mut entry = archive.by_index(i).with_context(|| format!("ZIP index {i}"))?;
+            let mut entry = archive
+                .by_index(i)
+                .with_context(|| format!("ZIP index {i}"))?;
             let member = sanitize_member_name(entry.name());
             let mut data = Vec::with_capacity(size as usize);
             entry
@@ -552,6 +603,28 @@ fn extract_zip_members<R: Read + Seek>(
     }
 
     Ok(samples)
+}
+
+fn archive_member_priority(name: &str) -> u8 {
+    let extension = Path::new(name)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        // Executables and common active payloads.
+        "exe" | "dll" | "sys" | "com" | "scr" | "cpl" | "elf" | "bin" | "apk" | "jar" | "dex"
+        | "class" | "js" | "jse" | "vbs" | "vbe" | "ps1" | "bat" | "cmd" | "sh" | "hta" | "msi" => {
+            0
+        }
+        // Likely configs, lures, or embedded content.
+        "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "pdf" | "rtf" | "xml" | "json"
+        | "ini" | "cfg" | "conf" | "dat" | "db" | "zip" | "rar" | "7z" => 1,
+        // Source/build metadata is useful, but less important under a hard cap.
+        "c" | "cc" | "cpp" | "h" | "hpp" | "cs" | "java" | "py" | "go" | "rs" | "sln"
+        | "vcxproj" | "pdb" | "md" | "txt" => 3,
+        _ => 2,
+    }
 }
 
 fn sanitize_member_name(name: &str) -> String {
@@ -590,8 +663,7 @@ mod tests {
         let cursor = Cursor::new(Vec::new());
         let mut writer = zip::ZipWriter::new(cursor);
         for (name, contents) in members {
-            let opts = SimpleFileOptions::default()
-                .with_aes_encryption(AesMode::Aes256, password);
+            let opts = SimpleFileOptions::default().with_aes_encryption(AesMode::Aes256, password);
             writer.start_file(*name, opts).unwrap();
             writer.write_all(contents).unwrap();
         }
@@ -702,5 +774,34 @@ mod tests {
     fn ignores_incomplete_zip_signature() {
         let data = b"MZ...PK\x03\x04not-a-complete-archive";
         assert!(embedded_zip_ranges(data).is_empty());
+    }
+
+    #[test]
+    fn zip_magic_rejects_bare_pk_prefix() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("vanguard-zip-magic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let junk = dir.join("junk.bin");
+        {
+            let mut f = File::create(&junk).unwrap();
+            f.write_all(b"PKXY").unwrap();
+        }
+        assert!(!looks_like_zip_magic(&junk).unwrap());
+        let empty = dir.join("empty.zip");
+        {
+            let mut f = File::create(&empty).unwrap();
+            f.write_all(b"PK\x05\x06").unwrap();
+            f.write_all(&[0u8; 18]).unwrap();
+        }
+        assert!(looks_like_zip_magic(&empty).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn password_rank_prefers_mixed_tokens() {
+        let ranked = password_candidate_rank("WNcry@2ol7");
+        let weak = password_candidate_rank("aaaaaaaa");
+        assert!(ranked < weak);
     }
 }

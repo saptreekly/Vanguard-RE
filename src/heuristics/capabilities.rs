@@ -1,11 +1,12 @@
 //! CAPA-style capability tags derived from the import table.
 
+use super::api_matches;
 use crate::triage::ImportEntry;
 
 /// A high-level capability inferred from imported APIs.
 #[derive(Debug, Clone)]
 pub struct CapabilityTag {
-    /// Stable id: `injection`, `c2`, `persistence`, …
+    /// Stable id: `injection`, `socket_client`, `persistence`, …
     pub id: String,
     pub label: String,
     /// 0–100 confidence from evidence density.
@@ -16,7 +17,7 @@ pub struct CapabilityTag {
 struct CapRule {
     id: &'static str,
     label: &'static str,
-    /// Any of these substrings (case-insensitive) on the function name count as evidence.
+    /// Exact API names (Win32 A/W/Ex suffixes normalized via `api_matches`).
     apis: &'static [&'static str],
     /// Minimum distinct evidence hits to emit the tag.
     min_hits: usize,
@@ -42,8 +43,8 @@ const RULES: &[CapRule] = &[
         min_hits: 1,
     },
     CapRule {
-        id: "c2",
-        label: "Network / C2",
+        id: "http_client",
+        label: "HTTP client",
         apis: &[
             "InternetOpen",
             "InternetConnect",
@@ -51,7 +52,15 @@ const RULES: &[CapRule] = &[
             "HttpOpenRequest",
             "WinHttpOpen",
             "WinHttpConnect",
+            "WinHttpSendRequest",
             "URLDownloadToFile",
+        ],
+        min_hits: 1,
+    },
+    CapRule {
+        id: "socket_client",
+        label: "Socket client",
+        apis: &[
             "WSAStartup",
             "socket",
             "connect",
@@ -59,8 +68,35 @@ const RULES: &[CapRule] = &[
             "recv",
             "WSASend",
             "WSARecv",
+            "WSAConnect",
+        ],
+        // Require two hits so a lone UI API can never tag networking.
+        min_hits: 2,
+    },
+    CapRule {
+        id: "smb_enum",
+        label: "SMB / share discovery",
+        apis: &[
+            "NetShareEnum",
+            "WNetEnumResource",
+            "NetServerEnum",
+            "WNetAddConnection",
+            "NetUseAdd",
         ],
         min_hits: 1,
+    },
+    CapRule {
+        id: "c2_suspect",
+        label: "C2-suspect HTTP",
+        // Stronger than a bare socket — download-to-file or multi-API WinINet.
+        apis: &[
+            "URLDownloadToFile",
+            "InternetOpen",
+            "HttpSendRequest",
+            "WinHttpSendRequest",
+            "InternetReadFile",
+        ],
+        min_hits: 2,
     },
     CapRule {
         id: "persistence",
@@ -167,6 +203,12 @@ const RULES: &[CapRule] = &[
         min_hits: 2,
     },
     CapRule {
+        id: "file_delete",
+        label: "File deletion",
+        apis: &["DeleteFile", "RemoveDirectory", "MoveFileEx"],
+        min_hits: 1,
+    },
+    CapRule {
         id: "exec",
         label: "Process execution",
         apis: &[
@@ -175,6 +217,9 @@ const RULES: &[CapRule] = &[
             "ShellExecute",
             "NtCreateUserProcess",
             "system",
+            "execl",
+            "execv",
+            "fork",
         ],
         min_hits: 1,
     },
@@ -188,7 +233,7 @@ fn api_names(imports: &[ImportEntry]) -> Vec<String> {
         .collect()
 }
 
-/// Tag capabilities from imports (CAPA-style summary for triage UI).
+/// Tag capabilities from imports (CAPA-style summary for triage).
 pub fn tag_capabilities(imports: &[ImportEntry]) -> Vec<CapabilityTag> {
     let apis = api_names(imports);
     let mut tags = Vec::new();
@@ -196,9 +241,8 @@ pub fn tag_capabilities(imports: &[ImportEntry]) -> Vec<CapabilityTag> {
     for rule in RULES {
         let mut evidence = Vec::new();
         for api in &apis {
-            let lower = api.to_ascii_lowercase();
             for needle in rule.apis {
-                if lower.contains(&needle.to_ascii_lowercase()) {
+                if api_matches(api, needle) {
                     evidence.push(api.clone());
                     break;
                 }
@@ -225,7 +269,7 @@ pub fn tag_capabilities(imports: &[ImportEntry]) -> Vec<CapabilityTag> {
     tags
 }
 
-/// Compact display list: `injection · c2 · persistence`
+/// Compact display list: `injection · socket_client · persistence`
 pub fn capability_summary(tags: &[CapabilityTag]) -> String {
     if tags.is_empty() {
         return "(none)".into();

@@ -1,17 +1,19 @@
 //! Automated investigation pipeline — default `vanguard <path>` behavior.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use crate::containment::{EmbeddedArchive, QuarantinedSample};
 use crate::crypto::{CryptoFinding, scan as scan_crypto};
 use crate::disasm::{DisasmReport, ExtractedString, disassemble, interesting_strings};
-use crate::heuristics::{CapabilityTag, capability_summary, score_imports};
+use crate::heuristics::{CapabilityTag, ThreatScore, capability_summary, score_imports};
 use crate::iocs::{IocKind, NetworkIoc, scan_data as scan_iocs};
 use crate::secrets::{SecretCandidate, scan as scan_secrets};
 use crate::signatures::{YaraMatch, build_hash_bundle, scan_yara};
-use crate::triage::{TriageReport, detect_packer_hints, parse_binary_named};
-use crate::util::sha256_hex;
+use crate::toolchain::ToolchainFinding;
+use crate::triage::{
+    BinaryFormat, ImportEntry, TriageReport, detect_packer_hints, parse_binary_named,
+};
 use anyhow::Result;
 
 #[derive(Debug, Clone)]
@@ -41,6 +43,8 @@ pub struct DeepDive {
     pub embedded_archives: Vec<EmbeddedArchive>,
     /// Heuristic password / credential candidates (shape-based, not proof).
     pub secrets: Vec<SecretCandidate>,
+    /// Pre-grouped imports for the Imports tab (library → functions).
+    pub grouped_imports: Vec<(String, Vec<String>)>,
     pub disasm: Option<DisasmReport>,
 }
 
@@ -82,28 +86,23 @@ pub fn triage_sample(sample: &QuarantinedSample, entropy_map: bool) -> Result<Tr
     let mut packer_hints = detect_packer_hints(&binary);
     let toolchain = crate::toolchain::identify(&sample.data, &binary);
 
-    // Raw / DOS COM: no IAT — still surface a useful verdict.
-    if matches!(
-        binary.format,
-        crate::triage::BinaryFormat::DosCom | crate::triage::BinaryFormat::Raw
-    ) && threat.score < 20
-    {
+    // DOS COM: no IAT — still surface a useful verdict. Raw blobs no longer
+    // get an automatic 35 (that flooded rankings with language packs / source).
+    if binary.format == BinaryFormat::DosCom && threat.score < 20 {
         threat.score = threat.score.max(35);
-        threat.label = match binary.format {
-            crate::triage::BinaryFormat::DosCom => {
-                "DOS COM / classic virus candidate (limited static analysis)".into()
-            }
-            _ => "unrecognized binary — hashes, entropy, YARA, strings only".into(),
-        };
+        threat.label = "DOS COM / classic virus candidate (limited static analysis)".into();
         packer_hints.push(
             "Not PE/ELF/Mach-O — header triage limited; deep-dive still extracts strings/YARA"
                 .into(),
         );
     }
 
+    apply_managed_score_floor(&sample.data, &toolchain, &mut threat);
+    apply_content_class_demotion(&sample.label, binary.format, &mut threat);
+
     Ok(TriageReport {
         path: sample.label.clone(),
-        sha256: sha256_hex(&sample.data),
+        sha256: hashes.sha256.clone(),
         size: sample.data.len() as u64,
         binary,
         hashes,
@@ -114,15 +113,180 @@ pub fn triage_sample(sample: &QuarantinedSample, entropy_map: bool) -> Result<Tr
     })
 }
 
+/// Managed PE IAT is usually just `_CorExeMain` — without a floor, AgentTesla
+/// scores 0 while a `.cpp` source blob ranks at 35. Bump .NET samples based on
+/// CLR confidence and stealer-shaped strings.
+fn apply_managed_score_floor(
+    data: &[u8],
+    toolchain: &[ToolchainFinding],
+    threat: &mut ThreatScore,
+) {
+    let Some(dotnet) = toolchain
+        .iter()
+        .find(|t| t.language == ".NET" && t.confidence >= 70)
+    else {
+        return;
+    };
+
+    let text = String::from_utf8_lossy(&data[..data.len().min(2 * 1024 * 1024)]).to_ascii_lowercase();
+    let stealer_markers = [
+        "login data",
+        "web data",
+        "user data",
+        "cookies",
+        "mozill",
+        "chrome",
+        "wallet.dat",
+        "smtp",
+        "telegram",
+        "discord.com/api",
+        "password",
+        "keylog",
+        "screenshot",
+        "clipboard",
+    ];
+    let stealer_hits = stealer_markers.iter().filter(|m| text.contains(*m)).count();
+
+    let floor = if stealer_hits >= 4 {
+        75
+    } else if stealer_hits >= 2 {
+        60
+    } else if stealer_hits >= 1 {
+        50
+    } else {
+        // Still outrank demoted noise so managed malware is not invisible.
+        40
+    };
+
+    if threat.score < floor {
+        threat.score = floor;
+        threat.label = format!(
+            "{} — .NET managed (conf {})",
+            if floor >= 70 {
+                "high risk"
+            } else if floor >= 40 {
+                "likely malicious tooling"
+            } else {
+                "suspicious"
+            },
+            dotnet.confidence
+        );
+        if stealer_hits > 0 {
+            threat.label.push_str(&format!(" / stealer-strings×{stealer_hits}"));
+        }
+    }
+}
+
+/// Demote source trees, build logs, and ransomware language packs so they
+/// cannot outrank real PE/ELF payloads in ranking.
+fn apply_content_class_demotion(path: &str, format: BinaryFormat, threat: &mut ThreatScore) {
+    let class = classify_content(path, format);
+    let (cap, label) = match class {
+        ContentClass::LanguagePack => (5, "language/resource pack — demoted"),
+        ContentClass::SourceBuild => (5, "source/build artifact — demoted"),
+        ContentClass::LowInterestRaw => (10, "non-executable blob — demoted"),
+        ContentClass::Interesting => return,
+    };
+    if threat.score > cap {
+        threat.score = cap;
+        threat.label = label.into();
+    } else if threat.score > 0 {
+        // Keep a tiny score but rewrite the misleading "suspicious" raw label.
+        threat.label = label.into();
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContentClass {
+    Interesting,
+    LanguagePack,
+    SourceBuild,
+    LowInterestRaw,
+}
+
+fn classify_content(path: &str, format: BinaryFormat) -> ContentClass {
+    let lower = path.replace('\\', "/").to_ascii_lowercase();
+    let file = Path::new(&lower)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(lower.as_str());
+    let ext = Path::new(&lower)
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+
+    // WannaCry-style message packs: msg/m_english.wnry (not u/c/t.wnry payloads).
+    if lower.contains("/msg/")
+        || lower.contains("/lang/")
+        || lower.contains("/locales/")
+        || file.starts_with("m_") && matches!(ext, "wnry" | "dll" | "mui")
+        || matches!(ext, "mui" | "nls")
+    {
+        return ContentClass::LanguagePack;
+    }
+
+    if matches!(
+        ext,
+        "c" | "cc"
+            | "cpp"
+            | "cxx"
+            | "h"
+            | "hpp"
+            | "hxx"
+            | "cs"
+            | "java"
+            | "py"
+            | "go"
+            | "rs"
+            | "sln"
+            | "vcxproj"
+            | "vcproj"
+            | "pdb"
+            | "idb"
+            | "ilk"
+            | "obj"
+            | "o"
+            | "a"
+            | "lib"
+            | "tlog"
+            | "log"
+            | "md"
+            | "txt"
+            | "rtf"
+            | "xml"
+            | "json"
+            | "yml"
+            | "yaml"
+            | "toml"
+            | "cmake"
+            | "makefile"
+    ) || file == "makefile"
+        || file.ends_with(".tlog")
+    {
+        return ContentClass::SourceBuild;
+    }
+
+    // Generic raw/text leftovers that are not DOS COM / PE / ELF / Mach-O.
+    if matches!(format, BinaryFormat::Raw | BinaryFormat::Unknown)
+        && !matches!(ext, "exe" | "dll" | "sys" | "scr" | "com" | "elf" | "so" | "bin" | "wnry")
+    {
+        return ContentClass::LowInterestRaw;
+    }
+
+    ContentClass::Interesting
+}
+
 /// Full automated investigation over in-memory quarantined samples.
 pub fn investigate(
     source: &str,
     samples: &[QuarantinedSample],
     opts: InvestigateOptions<'_>,
 ) -> Result<InvestigationReport> {
+    // Entropy heatmaps are unused in the TUI today — skip the O(sections)
+    // work on every sample (including ZIP children).
     let mut triage = Vec::with_capacity(samples.len());
     for s in samples {
-        match triage_sample(s, true) {
+        match triage_sample(s, false) {
             Ok(r) => triage.push(r),
             Err(e) => eprintln!("skip {}: {e:#}", s.label),
         }
@@ -142,7 +306,6 @@ pub fn investigate(
 
     let imphash_clusters = cluster_imphash(&triage);
 
-    let mut yara_by_sample = Vec::new();
     let data_by_label: BTreeMap<&str, &[u8]> = samples
         .iter()
         .map(|s| (s.label.as_str(), s.data.as_slice()))
@@ -152,14 +315,20 @@ pub fn investigate(
         .map(|s| (s.label.as_str(), s.embedded_archives.as_slice()))
         .collect();
 
+    // One YARA pass per sample — reused for ranking signals and deep-dives.
+    let mut yara_hits: BTreeMap<String, Vec<YaraMatch>> = BTreeMap::new();
     for r in &triage {
         if let Some(data) = data_by_label.get(r.path.as_str()) {
             let hits = scan_yara(data, opts.yara_rules);
             if !hits.is_empty() {
-                yara_by_sample.push((r.path.clone(), hits));
+                yara_hits.insert(r.path.clone(), hits);
             }
         }
     }
+    let yara_by_sample: Vec<(String, Vec<YaraMatch>)> = yara_hits
+        .iter()
+        .map(|(path, hits)| (path.clone(), hits.clone()))
+        .collect();
 
     // Deep-dive: top `deep` by score, plus any remaining with score >= min_deep_score.
     let mut deep_targets: Vec<&TriageReport> = triage.iter().take(opts.deep).collect();
@@ -174,10 +343,10 @@ pub fn investigate(
         let Some(data) = data_by_label.get(r.path.as_str()) else {
             continue;
         };
-        let yara = scan_yara(data, opts.yara_rules);
-        let disasm = disassemble(&r.path, data, None, opts.disasm_count, true).ok();
-        // Always extract from the full sample — do not reuse the disasm window's
-        // truncated string list (packed samples bury C2 domains under noise).
+        let yara = yara_hits.get(&r.path).cloned().unwrap_or_default();
+        // Skip the disasm-internal string pass — investigate already extracts
+        // strings from the full sample below (with_strings: false).
+        let disasm = disassemble(&r.path, data, None, opts.disasm_count, false).ok();
         let strings = {
             let all = crate::disasm::extract_strings_ranked(data, 8_000);
             interesting_strings(&all).into_iter().take(120).collect()
@@ -240,6 +409,7 @@ pub fn investigate(
             .map(|a| a.to_vec())
             .unwrap_or_default();
         let secrets = scan_secrets(data);
+        let grouped_imports = group_imports(&r.binary.imports);
 
         deep_dives.push(DeepDive {
             path: r.path.clone(),
@@ -253,6 +423,7 @@ pub fn investigate(
             crypto,
             embedded_archives,
             secrets,
+            grouped_imports,
             disasm,
         });
     }
@@ -266,6 +437,18 @@ pub fn investigate(
         yara_by_sample,
         deep_dives,
     })
+}
+
+fn group_imports(imports: &[ImportEntry]) -> Vec<(String, Vec<String>)> {
+    let mut map: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for import in imports {
+        map.entry(import.library.clone())
+            .or_default()
+            .insert(import.function.clone());
+    }
+    map.into_iter()
+        .map(|(library, functions)| (library, functions.into_iter().collect()))
+        .collect()
 }
 
 fn cluster_imphash(triage: &[TriageReport]) -> Vec<ImpHashCluster> {
@@ -301,4 +484,64 @@ fn cluster_imphash(triage: &[TriageReport]) -> Vec<ImpHashCluster> {
 
 pub fn short_name(path: &str) -> String {
     path.rsplit("::").next().unwrap_or(path).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::heuristics::ThreatScore;
+
+    fn blank_threat(score: u8) -> ThreatScore {
+        ThreatScore {
+            score,
+            label: "suspicious".into(),
+            behaviors: vec![],
+            suspicious_apis: vec![],
+            capabilities: vec![],
+        }
+    }
+
+    #[test]
+    fn demotes_wannacry_language_packs() {
+        assert_eq!(
+            classify_content("msg/m_english.wnry", BinaryFormat::Raw),
+            ContentClass::LanguagePack
+        );
+        assert_eq!(
+            classify_content("u.wnry", BinaryFormat::Raw),
+            ContentClass::Interesting
+        );
+        let mut threat = blank_threat(35);
+        apply_content_class_demotion("msg/m_chinese (simplified).wnry", BinaryFormat::Raw, &mut threat);
+        assert_eq!(threat.score, 5);
+    }
+
+    #[test]
+    fn demotes_source_and_tlog() {
+        assert_eq!(
+            classify_content("locker/main.cpp", BinaryFormat::Raw),
+            ContentClass::SourceBuild
+        );
+        assert_eq!(
+            classify_content("BuildLog.tlog", BinaryFormat::Raw),
+            ContentClass::SourceBuild
+        );
+        let mut threat = blank_threat(35);
+        apply_content_class_demotion("src/bot.c", BinaryFormat::Raw, &mut threat);
+        assert_eq!(threat.score, 5);
+    }
+
+    #[test]
+    fn managed_floor_lifts_dotnet_stealers() {
+        let toolchain = vec![ToolchainFinding {
+            language: ".NET".into(),
+            confidence: 100,
+            evidence: vec!["BSJB".into()],
+        }];
+        let data = b"Chrome Login Data cookies Web Data password keylog";
+        let mut threat = blank_threat(0);
+        apply_managed_score_floor(data, &toolchain, &mut threat);
+        assert!(threat.score >= 60, "stealer .NET floor too low: {}", threat.score);
+        assert!(threat.label.contains(".NET"));
+    }
 }
