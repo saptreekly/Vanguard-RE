@@ -5,8 +5,8 @@ edition = "2024"
 description = "High-speed, memory-safe static malware triage and reverse engineering toolkit"
 license = "MIT"
 authors = ["Vanguard-RE Contributors"]
-repository = "https://github.com/vanguard-re/vanguard-re"
-keywords = ["malware", "reverse-engineering", "pe", "elf", "yara"]
+repository = "https://github.com/saptreekly/Vanguard-RE"
+keywords = ["malware", "reverse-engineering", "pe", "elf", "triage"]
 categories = ["command-line-utilities", "parsing"]
 
 [[bin]]
@@ -15,25 +15,38 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
-crossterm = "0.28"
+crossterm = "0.29"
 goblin = "0.10"
 hex = "0.4"
-iced-x86 = { version = "1", features = ["std"] }
+iced-x86 = { version = "1", default-features = false, features = [
+    "std",
+    "decoder",
+    "nasm",
+    "instr_info",
+] }
 md-5 = "0.10"
 memmap2 = "0.9"
-ratatui = "0.30"
-rayon = "1"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+ratatui = { version = "0.30", default-features = false, features = [
+    "crossterm",
+    "layout-cache",
+    "macros",
+    "underline-color",
+] }
 sha2 = "0.10"
-symbolic-common = "12"
-symbolic-demangle = "12"
 walkdir = "2"
-yara-x = "=1.19.0"
-zip = { version = "2", default-features = false, features = ["aes-crypto", "deflate"] }
+# "deflate-flate2" gives decompress-capable deflate without the "deflate"
+# umbrella feature, which drags in zopfli (write-side compression). The direct
+# flate2 dep supplies the rust_backend feature via unification.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+zip = { version = "2", default-features = false, features = ["aes-crypto", "deflate-flate2", "flate2"] }
 
 [profile.release]
 lto = false
 codegen-units = 16
 panic = "abort"
 strip = true
+
+# Fast local iteration: `cargo build` uses this; release stays optimized.
+[profile.dev]
+opt-level = 0
+debug = 1

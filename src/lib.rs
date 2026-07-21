@@ -1,7 +1,7 @@
 //! Vanguard-RE — high-speed, memory-safe static malware analysis.
 //!
 //! Built on three pillars:
-//! - **Speed**: memmap2 + rayon for zero-copy, data-parallel scanning
+//! - **Speed**: memmap2 zero-copy I/O + focused static pipelines
 //! - **Accuracy**: formal PE/ELF/Mach-O parsing, ImpHash, entropy, signatures
 //! - **Safety**: Rust memory safety + in-memory quarantine (samples never executed)
 

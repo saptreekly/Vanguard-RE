@@ -4,13 +4,10 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use goblin::Object;
-use serde::Serialize;
-
 use super::entropy::{entropy_heatmap, section_entropy, SectionEntropy};
 use super::report::SectionInfo;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "UPPERCASE")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinaryFormat {
     Pe,
     Elf,
@@ -36,7 +33,7 @@ impl std::fmt::Display for BinaryFormat {
 }
 
 /// Structured view of a parsed binary after formal header walk.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct ParsedBinary {
     pub format: BinaryFormat,
     pub architecture: String,
@@ -55,7 +52,7 @@ pub struct ParsedBinary {
     pub entropy_maps: Vec<(String, String)>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct ImportEntry {
     pub library: String,
     pub function: String,

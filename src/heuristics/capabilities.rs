@@ -1,11 +1,9 @@
 //! CAPA-style capability tags derived from the import table.
 
-use serde::Serialize;
-
 use crate::triage::ImportEntry;
 
 /// A high-level capability inferred from imported APIs.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct CapabilityTag {
     /// Stable id: `injection`, `c2`, `persistence`, …
     pub id: String,

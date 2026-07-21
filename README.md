@@ -6,7 +6,7 @@ High-speed, memory-safe static malware triage — interactive TUI only.
 
 | Pillar | How |
 |--------|-----|
-| **Speed** | `memmap2` zero-copy I/O + `rayon` data-parallel bulk scanning |
+| **Speed** | `memmap2` zero-copy I/O + focused static pipelines |
 | **Accuracy** | Formal PE / ELF / Mach-O parsing (`goblin`), ImpHash, Shannon entropy maps, IAT heuristics, iced-x86 disassembly |
 | **Safety** | Rust memory safety + in-memory quarantine — samples are never executed |
 
@@ -20,15 +20,20 @@ High-speed, memory-safe static malware triage — interactive TUI only.
      ┌──────────────┼──────────────┐
      ▼              ▼              ▼
  Static Triage   Disassembly    Signature Engine
- Header Parser   Call Profiler  (hashes / YARA-X)
+ Header Parser   Call Profiler  (hashes / builtins)
 ```
 
 ## Build & install
 
 ```bash
+# Fast check while iterating
+cargo check
+
 cargo build --release
 cp target/release/vanguard ~/.local/bin/vanguard
 ```
+
+Builtin signature rules are a lightweight string/byte matcher (no embedded YARA-X / Wasmtime). External `.yar` files are currently ignored with a note.
 
 ## Usage
 
@@ -38,7 +43,7 @@ vanguard
 
 Menu → **Investigate sample / ZIP** → paste path, set password if needed → Run.
 
-Passworded malware packs (e.g. password `infected`) are decrypted into RAM only, then ranked, YARA-scanned, and deep-dived in the UI.
+Passworded malware packs (e.g. password `infected`) are decrypted into RAM only, then ranked, signature-scanned, and deep-dived in the UI.
 
 ### Keys
 

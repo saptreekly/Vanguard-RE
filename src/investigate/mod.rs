@@ -4,8 +4,6 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::Result;
-use serde::Serialize;
-
 use crate::containment::QuarantinedSample;
 use crate::disasm::{disassemble, interesting_strings, DisasmReport, ExtractedString};
 use crate::heuristics::{capability_summary, score_imports, CapabilityTag};
@@ -13,7 +11,7 @@ use crate::signatures::{build_hash_bundle, scan_yara, YaraMatch};
 use crate::triage::{detect_packer_hints, parse_binary_named, TriageReport};
 use crate::util::sha256_hex;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct ImpHashCluster {
     pub imphash: String,
     pub members: Vec<String>,
@@ -22,7 +20,7 @@ pub struct ImpHashCluster {
     pub virustotal_search: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct DeepDive {
     pub path: String,
     pub sha256: String,
@@ -34,7 +32,7 @@ pub struct DeepDive {
     pub disasm: Option<DisasmReport>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct InvestigationReport {
     pub source: String,
     pub sample_count: usize,

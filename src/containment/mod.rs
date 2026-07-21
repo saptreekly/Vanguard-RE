@@ -18,7 +18,6 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use serde::Serialize;
 use walkdir::WalkDir;
 use zip::ZipArchive;
 
@@ -35,7 +34,7 @@ pub struct QuarantinedSample {
     pub data: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct ContainmentReport {
     pub mode: &'static str,
     pub executes_samples: bool,

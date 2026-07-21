@@ -1,9 +1,7 @@
 //! Shannon entropy and ASCII heat-map rendering.
 
-use serde::Serialize;
-
 /// Per-section entropy summary.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct SectionEntropy {
     pub name: String,
     pub entropy: f64,

@@ -8,14 +8,11 @@ use anyhow::{bail, Context, Result};
 use iced_x86::{
     Decoder, DecoderOptions, FlowControl, Formatter, Instruction, NasmFormatter, OpKind,
 };
-use serde::Serialize;
-
 use crate::triage::{parse_binary, BinaryFormat, ParsedBinary};
 
 use cluster::{choose_k, function_features, kmeans, label_cluster, FEATURE_DIM};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlowKind {
     Fallthrough,
     Call,
@@ -26,7 +23,7 @@ pub enum FlowKind {
     Other,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct DisasmLine {
     pub address: u64,
     pub bytes: String,
@@ -38,7 +35,7 @@ pub struct DisasmLine {
     pub is_function_start: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct FunctionInfo {
     pub name: String,
     pub start: u64,
@@ -55,7 +52,7 @@ pub struct FunctionInfo {
     pub cluster_label: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct FunctionCluster {
     pub id: u8,
     pub label: String,
@@ -63,7 +60,7 @@ pub struct FunctionCluster {
     pub size: usize,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct ExtractedString {
     pub offset: u64,
     pub encoding: String,
@@ -72,7 +69,7 @@ pub struct ExtractedString {
     pub xrefs: Vec<u64>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct DisasmReport {
     pub path: String,
     pub architecture: String,
@@ -653,28 +650,19 @@ fn extract_utf16le_strings(data: &[u8], min_chars: usize) -> Vec<ExtractedString
     out
 }
 
-/// Demangle Rust (v0), C++, and Swift-ish symbols via symbolic-demangle.
+/// Demangle-ish filter without heavy demangler crates.
+/// Returns mangled-looking symbols for triage; full demangle is optional later.
 pub fn demangle_symbols(symbols: &[String]) -> Vec<String> {
-    use symbolic_common::Name;
-    use symbolic_demangle::{Demangle, DemangleOptions};
-
-    let opts = DemangleOptions::name_only();
     symbols
         .iter()
-        .filter_map(|s| {
-            if s.is_empty() {
-                return None;
-            }
-            let name = Name::from(s.as_str());
-            let demangled = name.try_demangle(opts);
-            if demangled != s.as_str() {
-                Some(format!("{s}  =>  {demangled}"))
-            } else if s.starts_with("_Z") || s.starts_with("__Z") || s.starts_with("_R") {
-                Some(s.clone())
-            } else {
-                None
-            }
+        .filter(|s| {
+            !s.is_empty()
+                && (s.starts_with("_Z")
+                    || s.starts_with("__Z")
+                    || s.starts_with("_R")
+                    || s.starts_with("?"))
         })
         .take(100)
+        .cloned()
         .collect()
 }

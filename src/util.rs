@@ -49,14 +49,3 @@ pub fn collect_targets(path: &Path, recursive: bool) -> Result<Vec<PathBuf>> {
     out.sort();
     Ok(out)
 }
-
-/// Configure the global rayon thread pool when `--jobs` is set.
-pub fn configure_parallelism(jobs: Option<usize>) -> Result<()> {
-    if let Some(n) = jobs {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(n)
-            .build_global()
-            .context("configure rayon thread pool")?;
-    }
-    Ok(())
-}

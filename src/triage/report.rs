@@ -1,12 +1,10 @@
 //! Triage report aggregation.
 
-use serde::Serialize;
-
 use crate::heuristics::ThreatScore;
 use crate::signatures::HashBundle;
 use crate::triage::formats::ParsedBinary;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct SectionInfo {
     pub name: String,
     pub virtual_address: u64,
@@ -17,7 +15,7 @@ pub struct SectionInfo {
     pub characteristics: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct TriageReport {
     pub path: String,
     pub sha256: String,

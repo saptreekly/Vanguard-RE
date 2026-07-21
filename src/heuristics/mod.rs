@@ -4,12 +4,10 @@ mod capabilities;
 
 pub use capabilities::{capability_summary, tag_capabilities, CapabilityTag};
 
-use serde::Serialize;
-
 use crate::triage::ImportEntry;
 
 /// A scored behavioral pattern matched against the import table.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct BehaviorMatch {
     pub name: String,
     pub severity: u8,
@@ -17,7 +15,7 @@ pub struct BehaviorMatch {
     pub matched_apis: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct ThreatScore {
     /// 0–100 aggregate risk score
     pub score: u8,

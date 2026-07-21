@@ -1,16 +1,15 @@
-//! Signature engine: ImpHash, file hashes, fuzzy-hash scaffolds, YARA-X.
+//! Signature engine: ImpHash, file hashes, lightweight builtin pattern rules.
 
 mod yara_rules;
 
 use md5::{Digest, Md5};
-use serde::Serialize;
 use sha2::Sha256;
 
 use crate::triage::ImportEntry;
 
 pub use yara_rules::{scan_builtin_rules, scan_yara_file};
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct HashBundle {
     pub md5: String,
     pub sha256: String,
@@ -91,7 +90,7 @@ pub fn build_hash_bundle(data: &[u8], imports: &[ImportEntry]) -> HashBundle {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct YaraMatch {
     pub rule: String,
     pub namespace: Option<String>,
