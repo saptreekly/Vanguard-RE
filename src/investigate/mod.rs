@@ -4,11 +4,12 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::Result;
-use crate::containment::QuarantinedSample;
+use crate::containment::{EmbeddedArchive, QuarantinedSample};
 use crate::crypto::{scan as scan_crypto, CryptoFinding};
 use crate::disasm::{disassemble, interesting_strings, DisasmReport, ExtractedString};
 use crate::heuristics::{capability_summary, score_imports, CapabilityTag};
-use crate::iocs::{scan_data as scan_iocs, NetworkIoc};
+use crate::iocs::{scan_data as scan_iocs, IocKind, NetworkIoc};
+use crate::secrets::{scan as scan_secrets, SecretCandidate};
 use crate::signatures::{build_hash_bundle, scan_yara, YaraMatch};
 use crate::triage::{detect_packer_hints, parse_binary_named, TriageReport};
 use crate::util::sha256_hex;
@@ -35,6 +36,11 @@ pub struct DeepDive {
     pub network_iocs: Vec<NetworkIoc>,
     /// Detected crypto schemes (constant fingerprints + crypto API imports).
     pub crypto: Vec<CryptoFinding>,
+    /// ZIP archives carved from this sample's own bytes (encrypted payload
+    /// bundles such as WannaCry's `.wnry` set), listed even when undecryptable.
+    pub embedded_archives: Vec<EmbeddedArchive>,
+    /// Heuristic password / credential candidates (shape-based, not proof).
+    pub secrets: Vec<SecretCandidate>,
     pub disasm: Option<DisasmReport>,
 }
 
@@ -140,6 +146,10 @@ pub fn investigate(
         .iter()
         .map(|s| (s.label.as_str(), s.data.as_slice()))
         .collect();
+    let embedded_by_label: BTreeMap<&str, &[EmbeddedArchive]> = samples
+        .iter()
+        .map(|s| (s.label.as_str(), s.embedded_archives.as_slice()))
+        .collect();
 
     for r in &triage {
         if let Some(data) = data_by_label.get(r.path.as_str()) {
@@ -208,8 +218,38 @@ pub fn investigate(
             }
         };
 
-        let network_iocs = scan_iocs(data);
+        let mut network_iocs = scan_iocs(data);
+        // Merge indicators recovered from this sample's own decrypted embedded
+        // members (e.g. WannaCry's `c.wnry` Tor C2 list, unlocked once the
+        // inner ZIP password was cracked). Only hostname-class indicators are
+        // pulled up: bare IPs buried inside a bundled Tor binary are that
+        // component's infrastructure, not this sample's C2, and would mislead.
+        let child_prefix = format!("{}::", r.path);
+        for child in samples.iter().filter(|s| s.label.starts_with(&child_prefix)) {
+            for ioc in scan_iocs(&child.data) {
+                let hostname_class = matches!(
+                    ioc.kind,
+                    IocKind::Onion | IocKind::Url | IocKind::Domain | IocKind::Email | IocKind::Bitcoin
+                );
+                if hostname_class && !network_iocs.iter().any(|e| e.value == ioc.value) {
+                    network_iocs.push(ioc);
+                }
+            }
+        }
+        network_iocs.sort_by(|a, b| {
+            b.confidence
+                .cmp(&a.confidence)
+                .then(b.count.cmp(&a.count))
+                .then(a.value.cmp(&b.value))
+        });
+        network_iocs.truncate(40);
+
         let crypto = scan_crypto(data, &r.binary.imports);
+        let embedded_archives = embedded_by_label
+            .get(r.path.as_str())
+            .map(|a| a.to_vec())
+            .unwrap_or_default();
+        let secrets = scan_secrets(data);
 
         deep_dives.push(DeepDive {
             path: r.path.clone(),
@@ -221,6 +261,8 @@ pub fn investigate(
             interesting_strings: strings,
             network_iocs,
             crypto,
+            embedded_archives,
+            secrets,
             disasm,
         });
     }

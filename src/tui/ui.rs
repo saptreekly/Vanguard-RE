@@ -4,9 +4,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
 
-use vanguard_re::containment::containment_policy;
+use vanguard_re::containment::{containment_policy, EmbeddedArchive};
 use vanguard_re::disasm::TokenKind;
 use vanguard_re::investigate::short_name;
+use vanguard_re::secrets::SecretCandidate;
 
 use super::app::{App, DisasmFocus, FormField, Screen};
 
@@ -730,79 +731,105 @@ fn draw_deep_dive(frame: &mut Frame<'_>, app: &App, area: Rect, di: usize) {
         }
     }
     right_lines.push(Line::from(""));
-    let behaviors: Vec<&str> = triage
-        .map(|t| {
-            t.threat
-                .behaviors
-                .iter()
-                .map(|b| b.name.as_str())
-                .collect()
-        })
-        .unwrap_or_default();
-    if !behaviors.is_empty() {
-        right_lines.push(Line::from(vec![
-            Span::styled("behaviors ", Style::default().fg(MUTED)),
-            Span::styled(
-                truncate(&behaviors.join(" · "), right_w.saturating_sub(10)),
-                Style::default().fg(FG),
-            ),
-        ]));
-    }
-    right_lines.push(Line::from(vec![
-        Span::styled("sigs      ", Style::default().fg(MUTED)),
-        if dive.yara.is_empty() {
-            Span::styled("(no builtin hits)", Style::default().fg(MUTED))
-        } else {
-            Span::styled(
-                truncate(
-                    &dive
-                        .yara
-                        .iter()
-                        .map(|y| y.rule.as_str())
-                        .collect::<Vec<_>>()
-                        .join(" · "),
-                    right_w.saturating_sub(10),
-                ),
-                Style::default().fg(WARN),
-            )
-        },
-    ]));
-    right_lines.push(Line::from(vec![
-        Span::styled("crypto    ", Style::default().fg(MUTED)),
-        if dive.crypto.is_empty() {
-            Span::styled("(none detected)", Style::default().fg(MUTED))
-        } else {
-            Span::styled(
-                truncate(
-                    &dive
-                        .crypto
-                        .iter()
-                        .map(|c| c.name.as_str())
-                        .collect::<Vec<_>>()
-                        .join(" · "),
-                    right_w.saturating_sub(10),
-                ),
-                Style::default().fg(Color::LightGreen),
-            )
-        },
-    ]));
 
-    // Every row is pre-truncated to one line, so heights are exact.
+    // Consistent "label   value" summary rows sharing a fixed label column.
+    const SW: usize = 11;
+    let val_w = right_w.saturating_sub(SW);
+    let summary_row = |label: &str, value: String, style: Style| {
+        Line::from(vec![
+            Span::styled(format!("{label:<SW$}"), Style::default().fg(MUTED)),
+            Span::styled(truncate(&value, val_w), style),
+        ])
+    };
+    let none = |s: &str| (s.to_string(), Style::default().fg(MUTED));
+
+    let behaviors: Vec<&str> = triage
+        .map(|t| t.threat.behaviors.iter().map(|b| b.name.as_str()).collect())
+        .unwrap_or_default();
+    let (bv, bs) = if behaviors.is_empty() {
+        none("(none observed)")
+    } else {
+        (behaviors.join(" · "), Style::default().fg(FG))
+    };
+    right_lines.push(summary_row("behaviors", bv, bs));
+
+    let (yv, ys) = if dive.yara.is_empty() {
+        none("(no builtin hits)")
+    } else {
+        (
+            dive.yara.iter().map(|y| y.rule.as_str()).collect::<Vec<_>>().join(" · "),
+            Style::default().fg(WARN),
+        )
+    };
+    right_lines.push(summary_row("sigs", yv, ys));
+
+    let (cv, cs) = if dive.crypto.is_empty() {
+        none("(none detected)")
+    } else {
+        (
+            dive.crypto.iter().map(|c| c.name.as_str()).collect::<Vec<_>>().join(" · "),
+            Style::default().fg(Color::LightGreen),
+        )
+    };
+    right_lines.push(summary_row("crypto", cv, cs));
+
+    // Techniques were previously shown atop the (now removed) disasm panel.
+    let (tv, ts) = match &dive.disasm {
+        Some(d) if !d.insights.is_empty() => (
+            d.insights.iter().map(|i| i.id.as_str()).collect::<Vec<_>>().join(" · "),
+            Style::default().fg(BAD),
+        ),
+        Some(_) => none("(none flagged)"),
+        None => none("(disasm unavailable)"),
+    };
+    right_lines.push(summary_row("techniques", tv, ts));
+
+    // Each row is pre-truncated to one line, so the panel height is exact.
     let meta_h = (left_lines.len().max(right_lines.len()) as u16 + 2).clamp(8, 14);
 
-    // —— strings + network IOCs share a row, each sized to content ——
-    let shown_strings = dive.interesting_strings.len().min(14);
-    let shown_iocs = dive.network_iocs.len().min(10);
-    let row_h = (shown_strings.max(shown_iocs).max(1) as u16 + 2).min(16);
+    // —— optional content-sized rows: possible secrets, embedded archives ——
+    let sec_lines = secret_lines(&dive.secrets, inner_w);
+    let sec_h: u16 = if sec_lines.is_empty() {
+        0
+    } else {
+        (sec_lines.len() as u16 + 2).min(9)
+    };
+    let emb_lines = embedded_archive_lines(&dive.embedded_archives, inner_w);
+    let emb_h: u16 = if emb_lines.is_empty() {
+        0
+    } else {
+        (emb_lines.len() as u16 + 2).min(14)
+    };
 
+    // Layout: identity/signals · strings+IOCs (fills) · [secrets] · [embedded]
+    //         · disasm hint · help. Optional rows collapse when empty.
+    let mut constraints = vec![Constraint::Length(meta_h), Constraint::Min(6)];
+    let content_idx = 1usize;
+    let mut next = 2usize;
+    let sec_idx = if sec_h > 0 {
+        constraints.push(Constraint::Length(sec_h));
+        let i = next;
+        next += 1;
+        Some(i)
+    } else {
+        None
+    };
+    let emb_idx = if emb_h > 0 {
+        constraints.push(Constraint::Length(emb_h));
+        let i = next;
+        next += 1;
+        Some(i)
+    } else {
+        None
+    };
+    constraints.push(Constraint::Length(1));
+    let hint_idx = next;
+    next += 1;
+    constraints.push(Constraint::Length(3));
+    let help_idx = next;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(meta_h),
-            Constraint::Length(row_h),
-            Constraint::Min(6),
-            Constraint::Length(3),
-        ])
+        .constraints(constraints)
         .split(area);
 
     let detail_cols = Layout::default()
@@ -822,12 +849,16 @@ fn draw_deep_dive(frame: &mut Frame<'_>, app: &App, area: Rect, di: usize) {
         detail_cols[1],
     );
 
+    // —— interesting strings + network IOCs fill the freed vertical space ——
     let row_cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(chunks[1]);
+        .split(chunks[content_idx]);
     let str_w = (row_cols[0].width as usize).saturating_sub(2);
     let ioc_w = (row_cols[1].width as usize).saturating_sub(2);
+    let list_cap = (chunks[content_idx].height as usize).saturating_sub(2);
+    let shown_strings = dive.interesting_strings.len().min(list_cap);
+    let shown_iocs = dive.network_iocs.len().min(list_cap);
 
     let mut string_lines = Vec::new();
     if dive.interesting_strings.is_empty() {
@@ -846,13 +877,12 @@ fn draw_deep_dive(frame: &mut Frame<'_>, app: &App, area: Rect, di: usize) {
             ]));
         }
     }
-    let strings_title = format!(
-        "interesting strings ({}/{})",
-        shown_strings,
-        dive.interesting_strings.len()
-    );
     frame.render_widget(
-        Paragraph::new(string_lines).block(title_block(&strings_title)),
+        Paragraph::new(string_lines).block(title_block(&format!(
+            "interesting strings ({}/{})",
+            shown_strings,
+            dive.interesting_strings.len()
+        ))),
         row_cols[0],
     );
 
@@ -866,79 +896,42 @@ fn draw_deep_dive(frame: &mut Frame<'_>, app: &App, area: Rect, di: usize) {
         row_cols[1],
     );
 
-    // —— entry disassembly (fills remaining space) ——
-    let mut disasm_lines = Vec::new();
-    let disasm_cap = (chunks[2].height as usize).saturating_sub(3);
-    if let Some(d) = &dive.disasm {
-        disasm_lines.push(Line::from(Span::styled(
-            format!(
-                "{} @ {:#x}  ·  {} functions  ·  press d to explore",
-                d.architecture,
-                d.start_address,
-                d.functions.len()
-            ),
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        )));
-        if !d.insights.is_empty() {
-            let mut spans = vec![Span::styled(
-                "techniques  ",
-                Style::default().fg(MUTED),
-            )];
-            let names = d
-                .insights
-                .iter()
-                .map(|i| i.id.as_str())
-                .collect::<Vec<_>>()
-                .join(" · ");
-            spans.push(Span::styled(
-                truncate(&names, inner_w.saturating_sub(13)),
-                Style::default().fg(BAD).add_modifier(Modifier::BOLD),
-            ));
-            disasm_lines.push(Line::from(spans));
-        }
-        let mut pad = 0usize;
-        for line in d.instructions.iter() {
-            if disasm_lines.len() > disasm_cap {
-                break;
-            }
-            let t = line.text.to_ascii_lowercase();
-            let is_pad = t == "add [eax],al" || t == "add [rax],al" || t == "nop";
-            if is_pad && !line.anti_debug {
-                pad += 1;
-                if pad >= 3 {
-                    break;
-                }
-                continue;
-            }
-            pad = 0;
-            let mut spans = vec![
-                Span::styled(
-                    format!("  {:#010x}  ", line.address),
-                    Style::default().fg(MUTED),
-                ),
-                Span::styled(
-                    format!("{:<14}  ", truncate(&line.bytes, 14)),
-                    Style::default().fg(MUTED),
-                ),
-            ];
-            spans.extend(insn_spans(&line.tokens, line.anti_debug));
-            if line.anti_debug {
-                spans.push(Span::styled(
-                    "  anti-debug",
-                    Style::default().fg(BAD).add_modifier(Modifier::BOLD),
-                ));
-            }
-            disasm_lines.push(Line::from(spans));
-        }
-    } else {
-        disasm_lines.push(Line::from(Span::styled(
-            "  (disasm unavailable)",
-            Style::default().fg(MUTED),
-        )));
+    if let Some(idx) = sec_idx {
+        frame.render_widget(
+            Paragraph::new(sec_lines).block(title_block(&format!(
+                "possible secrets ({})  ·  heuristic — verify manually",
+                dive.secrets.len()
+            ))),
+            chunks[idx],
+        );
     }
+
+    if let Some(idx) = emb_idx {
+        let count = dive.embedded_archives.len();
+        frame.render_widget(
+            Paragraph::new(emb_lines).block(title_block(&format!(
+                "embedded archives ({count})  ·  carved from sample bytes"
+            ))),
+            chunks[idx],
+        );
+    }
+
+    // —— disasm moved to its own explorer; leave a one-line pointer ——
+    let disasm_hint = match &dive.disasm {
+        Some(d) => format!(
+            "  disassembly  ·  {} @ {:#x}  ·  {} functions  ·  press d / enter to explore",
+            d.architecture,
+            d.start_address,
+            d.functions.len()
+        ),
+        None => "  disassembly  ·  (unavailable for this sample)".to_string(),
+    };
     frame.render_widget(
-        Paragraph::new(disasm_lines).block(title_block("entry disassembly")),
-        chunks[2],
+        Paragraph::new(Line::from(Span::styled(
+            truncate(&disasm_hint, inner_w),
+            Style::default().fg(ACCENT),
+        ))),
+        chunks[hint_idx],
     );
 
     frame.render_widget(
@@ -947,8 +940,120 @@ fn draw_deep_dive(frame: &mut Frame<'_>, app: &App, area: Rect, di: usize) {
             ("d/enter", "function map"),
             ("b/esc", "ranking"),
         ]),
-        chunks[3],
+        chunks[help_idx],
     );
+}
+
+/// Build the possible-secrets panel: ranked, shape-based credential guesses.
+fn secret_lines(secrets: &[SecretCandidate], width: usize) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for s in secrets.iter().take(7) {
+        let style = if s.score >= 80 {
+            Style::default().fg(BAD).add_modifier(Modifier::BOLD)
+        } else if s.score >= 65 {
+            Style::default().fg(WARN)
+        } else {
+            Style::default().fg(FG)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {:<6}", s.kind.label()), style),
+            Span::styled(
+                format!("{:<width$}", truncate(&s.value, width.saturating_sub(14)), width = width.saturating_sub(14)),
+                Style::default().fg(Color::White),
+            ),
+            Span::styled(format!("  {:>3}", s.score), Style::default().fg(MUTED)),
+        ]));
+    }
+    lines
+}
+
+/// Build the embedded-archive panel: a header per carved ZIP plus a bounded
+/// member listing. Encrypted-but-undecryptable payloads (WannaCry's `.wnry`
+/// bundle) are flagged in red because their presence alone is diagnostic.
+fn embedded_archive_lines(archives: &[EmbeddedArchive], width: usize) -> Vec<Line<'static>> {
+    const MAX_LINES: usize = 12;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if archives.is_empty() {
+        return lines;
+    }
+
+    let total_members: usize = archives.iter().map(|a| a.member_count()).sum();
+    let mut shown_members = 0usize;
+
+    'outer: for a in archives {
+        let enc = a.encrypted_count();
+        let header = format!(
+            "{} @ {:#x} · {} files · {} enc · {} · {} extracted",
+            a.label,
+            a.offset,
+            a.member_count(),
+            enc,
+            human_size(a.total_size()),
+            a.extracted,
+        );
+        let hstyle = if a.recovered_password.is_some() {
+            Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD)
+        } else if enc > 0 && a.extracted == 0 {
+            Style::default().fg(BAD).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+        };
+        lines.push(Line::from(Span::styled(truncate(&header, width), hstyle)));
+
+        // A cracked inner password is a headline finding — show it verbatim.
+        if let Some(pw) = &a.recovered_password {
+            lines.push(Line::from(vec![
+                Span::styled("  password recovered  ", Style::default().fg(MUTED)),
+                Span::styled(
+                    truncate(pw, width.saturating_sub(22)),
+                    Style::default()
+                        .fg(Color::LightGreen)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]));
+        }
+
+        for m in &a.members {
+            // Reserve the final line for a "+N more" summary when truncating.
+            if lines.len() >= MAX_LINES - 1 && shown_members < total_members {
+                break 'outer;
+            }
+            let lower = m.name.to_ascii_lowercase();
+            let name_style = if lower.ends_with(".exe")
+                || lower.ends_with(".dll")
+                || lower.ends_with(".sys")
+            {
+                Style::default().fg(WARN)
+            } else {
+                Style::default().fg(FG)
+            };
+            let name = truncate(&m.name, width.saturating_sub(22));
+            lines.push(Line::from(vec![
+                Span::styled(
+                    if m.encrypted { "  enc " } else { "      " }.to_string(),
+                    if m.encrypted {
+                        Style::default().fg(BAD)
+                    } else {
+                        Style::default().fg(MUTED)
+                    },
+                ),
+                Span::styled(format!("{name:<width$}", width = width.saturating_sub(22)), name_style),
+                Span::styled(
+                    format!("  {:>9}", human_size(m.size)),
+                    Style::default().fg(MUTED),
+                ),
+            ]));
+            shown_members += 1;
+        }
+    }
+
+    if shown_members < total_members {
+        lines.push(Line::from(Span::styled(
+            format!("  … +{} more", total_members - shown_members),
+            Style::default().fg(MUTED),
+        )));
+    }
+    lines
 }
 
 fn draw_disasm_explorer(frame: &mut Frame<'_>, app: &App, area: Rect) {

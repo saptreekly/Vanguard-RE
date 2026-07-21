@@ -16,6 +16,8 @@ pub enum IocKind {
     Onion,
     Domain,
     Email,
+    /// Bitcoin wallet address (ransom payment).
+    Bitcoin,
 }
 
 impl IocKind {
@@ -27,6 +29,7 @@ impl IocKind {
             Self::Onion => "ONION",
             Self::Domain => "DOMAIN",
             Self::Email => "EMAIL",
+            Self::Bitcoin => "BTC",
         }
     }
 }
@@ -70,9 +73,11 @@ pub fn scan_data(data: &[u8]) -> Vec<NetworkIoc> {
     for s in &strings {
         scan_text(&s.value, &mut found);
     }
-    // Raw TLD-anchored pass catches domains that survived packing as contiguous
+    // Raw byte passes catch indicators that survived packing as contiguous
     // printable runs but were outranked / filtered from the string list.
     scan_raw_domains(data, &mut found);
+    scan_raw_onions(data, &mut found);
+    scan_raw_bitcoin(data, &mut found);
 
     // Drop bare domains/IPs that already appear inside a captured URL.
     let urls: Vec<String> = found
@@ -110,6 +115,7 @@ fn scan_text(text: &str, found: &mut BTreeMap<String, NetworkIoc>) {
     scan_urls(text, found);
     scan_ipv4(text, found);
     scan_tokens(text, found);
+    scan_bitcoin_text(text, found);
 }
 
 const URL_SCHEMES: &[&str] = &["http://", "https://", "ftp://", "ws://", "wss://"];
@@ -449,6 +455,160 @@ fn find_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
+// ── Tor onion services ───────────────────────────────────────────────────
+
+fn is_base32_onion(b: u8) -> bool {
+    matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'2'..=b'7')
+}
+
+/// Raw byte scan for `<base32>.onion` (v2 = 16 chars, v3 = 56 chars).
+fn scan_raw_onions(data: &[u8], found: &mut BTreeMap<String, NetworkIoc>) {
+    let window = &data[..data.len().min(16 * 1024 * 1024)];
+    let mut start = 0;
+    while let Some(rel) = find_bytes(&window[start..], b".onion") {
+        let dot = start + rel;
+        // Backtrack over base32 label chars.
+        let mut i = dot;
+        while i > 0 && is_base32_onion(window[i - 1]) {
+            i -= 1;
+        }
+        let label_len = dot - i;
+        if label_len == 16 || label_len == 56 {
+            if let Ok(label) = std::str::from_utf8(&window[i..dot]) {
+                let host = format!("{}.onion", label.to_ascii_lowercase());
+                add(
+                    found,
+                    NetworkIoc {
+                        kind: IocKind::Onion,
+                        value: host,
+                        confidence: 95,
+                        count: 1,
+                        private: false,
+                    },
+                );
+            }
+        }
+        start = dot + 1;
+    }
+}
+
+// ── Bitcoin wallet addresses (ransom payment IOCs) ─────────────────────────
+
+const B58_ALPHABET: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+
+fn is_base58(b: u8) -> bool {
+    B58_ALPHABET.contains(&b)
+}
+
+/// Decode base58 to bytes (no checksum). `None` on invalid character.
+fn base58_decode(s: &str) -> Option<Vec<u8>> {
+    let mut bytes: Vec<u8> = Vec::with_capacity(s.len());
+    for c in s.bytes() {
+        let val = B58_ALPHABET.iter().position(|&a| a == c)? as u32;
+        let mut carry = val;
+        for b in bytes.iter_mut() {
+            carry += (*b as u32) * 58;
+            *b = (carry & 0xff) as u8;
+            carry >>= 8;
+        }
+        while carry > 0 {
+            bytes.push((carry & 0xff) as u8);
+            carry >>= 8;
+        }
+    }
+    // Leading '1's map to leading zero bytes.
+    for c in s.bytes() {
+        if c == b'1' {
+            bytes.push(0);
+        } else {
+            break;
+        }
+    }
+    bytes.reverse();
+    Some(bytes)
+}
+
+/// Validate a P2PKH/P2SH Base58Check address by its double-SHA256 checksum.
+fn is_valid_btc_base58(s: &str) -> bool {
+    if s.len() < 26 || s.len() > 35 || !(s.starts_with('1') || s.starts_with('3')) {
+        return false;
+    }
+    let Some(decoded) = base58_decode(s) else {
+        return false;
+    };
+    if decoded.len() != 25 {
+        return false;
+    }
+    let (payload, checksum) = decoded.split_at(21);
+    use sha2::{Digest, Sha256};
+    let first = Sha256::digest(payload);
+    let second = Sha256::digest(first);
+    second[..4] == *checksum
+}
+
+/// Lightweight bech32 (`bc1…`) validation: prefix + charset + length.
+/// Full polymod checksum is skipped; length/charset already rule out noise.
+fn is_probable_bech32(s: &str) -> bool {
+    let lower = s.to_ascii_lowercase();
+    if !lower.starts_with("bc1") || lower.len() < 14 || lower.len() > 74 {
+        return false;
+    }
+    const BECH32: &[u8] = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+    lower.bytes().skip(3).all(|b| BECH32.contains(&b))
+}
+
+fn add_bitcoin(found: &mut BTreeMap<String, NetworkIoc>, addr: &str, confidence: u8) {
+    add(
+        found,
+        NetworkIoc {
+            kind: IocKind::Bitcoin,
+            value: addr.to_string(),
+            confidence,
+            count: 1,
+            private: false,
+        },
+    );
+}
+
+/// Token-level Bitcoin scan over an extracted string.
+fn scan_bitcoin_text(text: &str, found: &mut BTreeMap<String, NetworkIoc>) {
+    for raw in text.split(|c: char| !c.is_ascii_alphanumeric()) {
+        if raw.len() < 14 {
+            continue;
+        }
+        if is_valid_btc_base58(raw) {
+            add_bitcoin(found, raw, 96);
+        } else if is_probable_bech32(raw) {
+            add_bitcoin(found, &raw.to_ascii_lowercase(), 85);
+        }
+    }
+}
+
+/// Raw byte scan for Base58Check Bitcoin addresses (checksum-validated).
+fn scan_raw_bitcoin(data: &[u8], found: &mut BTreeMap<String, NetworkIoc>) {
+    let window = &data[..data.len().min(16 * 1024 * 1024)];
+    let mut i = 0;
+    while i < window.len() {
+        if !is_base58(window[i]) {
+            i += 1;
+            continue;
+        }
+        let s = i;
+        while i < window.len() && is_base58(window[i]) {
+            i += 1;
+        }
+        let run = &window[s..i];
+        if run.len() < 26 || run.len() > 35 {
+            continue;
+        }
+        if let Ok(tok) = std::str::from_utf8(run) {
+            if is_valid_btc_base58(tok) {
+                add_bitcoin(found, tok, 96);
+            }
+        }
+    }
+}
+
 /// Heuristic: `label(.label)+.tld` with a known TLD and no spaces.
 fn looks_like_domain(host: &str) -> bool {
     if host.len() < 4 || host.len() > 253 || host.starts_with('.') || host.ends_with('.') {
@@ -558,6 +718,42 @@ mod tests {
         // But real short-ccTLD domains still pass.
         assert!(looks_like_domain("evil.ru"));
         assert!(looks_like_domain("router.io"));
+    }
+
+    #[test]
+    fn detects_real_wannacry_bitcoin_addresses() {
+        // The three hardcoded WannaCry ransom wallets (public IOCs).
+        for addr in [
+            "13AM4VW2dhxYgXeQepoHkHSQuy6NgaEb94",
+            "12t9YDPgwueZ9NyMgw519p7AA8isjr6SMw",
+            "115p7UMMngoj1pMvkpHijcRdfJNXj6LrLn",
+        ] {
+            assert!(is_valid_btc_base58(addr), "should validate {addr}");
+            let blob = format!("send btc to {addr} now").into_bytes();
+            let iocs = scan_data(&blob);
+            let hit = iocs.iter().find(|i| i.value == addr).unwrap();
+            assert_eq!(hit.kind, IocKind::Bitcoin);
+            assert!(hit.confidence >= 90);
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_base58check() {
+        // Valid alphabet, right length, but checksum fails.
+        assert!(!is_valid_btc_base58("13AM4VW2dhxYgXeQepoHkHSQuy6NgaEb95"));
+        assert!(!is_valid_btc_base58("1111111111111111111111111111111111"));
+    }
+
+    #[test]
+    fn detects_real_wannacry_onions() {
+        // Hardcoded WannaCry v2 onion C2 addresses (16-char base32).
+        for onion in ["gx7ekbenv2riucmf.onion", "57g7spgrzlojinas.onion"] {
+            let blob = format!("c2\x00{onion}\x00next").into_bytes();
+            let iocs = scan_data(&blob);
+            let hit = iocs.iter().find(|i| i.value == onion).unwrap();
+            assert_eq!(hit.kind, IocKind::Onion);
+            assert!(hit.confidence >= 90);
+        }
     }
 
     #[test]

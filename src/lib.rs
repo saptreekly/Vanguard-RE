@@ -12,10 +12,13 @@ pub mod disasm;
 pub mod heuristics;
 pub mod iocs;
 pub mod investigate;
+pub mod secrets;
 pub mod signatures;
 pub mod triage;
 pub mod util;
 
-pub use containment::{collect_samples, containment_policy, QuarantinedSample};
+pub use containment::{
+    collect_samples, containment_policy, EmbeddedArchive, EmbeddedMember, QuarantinedSample,
+};
 pub use investigate::{investigate, InvestigateOptions, InvestigationReport};
 pub use triage::{BinaryFormat, TriageReport};
