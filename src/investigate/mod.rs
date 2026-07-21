@@ -5,8 +5,10 @@ use std::path::Path;
 
 use anyhow::Result;
 use crate::containment::QuarantinedSample;
+use crate::crypto::{scan as scan_crypto, CryptoFinding};
 use crate::disasm::{disassemble, interesting_strings, DisasmReport, ExtractedString};
 use crate::heuristics::{capability_summary, score_imports, CapabilityTag};
+use crate::iocs::{scan_data as scan_iocs, NetworkIoc};
 use crate::signatures::{build_hash_bundle, scan_yara, YaraMatch};
 use crate::triage::{detect_packer_hints, parse_binary_named, TriageReport};
 use crate::util::sha256_hex;
@@ -29,6 +31,10 @@ pub struct DeepDive {
     pub capabilities: Vec<CapabilityTag>,
     pub yara: Vec<YaraMatch>,
     pub interesting_strings: Vec<ExtractedString>,
+    /// Hardcoded network indicators (C2 candidates) ranked by confidence.
+    pub network_iocs: Vec<NetworkIoc>,
+    /// Detected crypto schemes (constant fingerprints + crypto API imports).
+    pub crypto: Vec<CryptoFinding>,
     pub disasm: Option<DisasmReport>,
 }
 
@@ -159,14 +165,30 @@ pub fn investigate(
         };
         let yara = scan_yara(data, opts.yara_rules);
         let disasm = disassemble(&r.path, data, None, opts.disasm_count, true).ok();
-        let strings = match &disasm {
-            Some(d) => interesting_strings(&d.strings),
-            None => {
-                // Still extract strings even if disasm fails (e.g. non-x86)
-                let all = crate::disasm::extract_strings_only(data);
-                interesting_strings(&all)
-            }
+        // Always extract from the full sample — do not reuse the disasm window's
+        // truncated string list (packed samples bury C2 domains under noise).
+        let mut strings = {
+            let all = crate::disasm::extract_strings_ranked(data, 8_000);
+            interesting_strings(&all)
         };
+        // Surface imported DLLs even when the string table is sparse.
+        for lib in r
+            .binary
+            .imports
+            .iter()
+            .map(|i| i.library.as_str())
+            .collect::<std::collections::BTreeSet<_>>()
+        {
+            if !strings.iter().any(|s| s.value.eq_ignore_ascii_case(lib)) {
+                strings.push(ExtractedString {
+                    offset: 0,
+                    encoding: "import".into(),
+                    value: lib.to_string(),
+                    xrefs: Vec::new(),
+                });
+            }
+        }
+        strings.truncate(120);
 
         let reason = {
             let caps = capability_summary(&r.threat.capabilities);
@@ -186,6 +208,9 @@ pub fn investigate(
             }
         };
 
+        let network_iocs = scan_iocs(data);
+        let crypto = scan_crypto(data, &r.binary.imports);
+
         deep_dives.push(DeepDive {
             path: r.path.clone(),
             sha256: r.sha256.clone(),
@@ -194,6 +219,8 @@ pub fn investigate(
             capabilities: r.threat.capabilities.clone(),
             yara,
             interesting_strings: strings,
+            network_iocs,
+            crypto,
             disasm,
         });
     }

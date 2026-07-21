@@ -5,6 +5,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
 
 use vanguard_re::containment::containment_policy;
+use vanguard_re::disasm::TokenKind;
 use vanguard_re::investigate::short_name;
 
 use super::app::{App, DisasmFocus, FormField, Screen};
@@ -21,10 +22,103 @@ fn title_block(title: &str) -> Block<'static> {
         .border_style(Style::default().fg(ACCENT))
         .title(Span::styled(
             format!(" {title} "),
-            Style::default()
-                .fg(ACCENT)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ))
+}
+
+fn pane_block(title: &str, focused: bool) -> Block<'static> {
+    let color = if focused { ACCENT } else { MUTED };
+    Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(color))
+        .title(Span::styled(
+            format!(" {title} "),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ))
+}
+
+/// One-line key legend rendered inside a muted border.
+fn help_bar(pairs: &[(&str, &str)]) -> Paragraph<'static> {
+    let mut spans = Vec::with_capacity(pairs.len() * 2);
+    for (i, (key, desc)) in pairs.iter().enumerate() {
+        spans.push(Span::styled(
+            (*key).to_string(),
+            Style::default().fg(ACCENT),
+        ));
+        let tail = if i + 1 == pairs.len() {
+            format!(" {desc}")
+        } else {
+            format!(" {desc}   ")
+        };
+        spans.push(Span::styled(tail, Style::default().fg(MUTED)));
+    }
+    Paragraph::new(Line::from(spans)).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(MUTED)),
+    )
+}
+
+fn token_style(kind: TokenKind) -> Style {
+    match kind {
+        TokenKind::Mnemonic => Style::default().fg(Color::LightYellow),
+        TokenKind::Register => Style::default().fg(Color::LightCyan),
+        TokenKind::Number => Style::default().fg(Color::LightMagenta),
+        TokenKind::Keyword => Style::default().fg(Color::Green),
+        TokenKind::Punct => Style::default().fg(FG),
+        TokenKind::Address => Style::default().fg(Color::LightGreen),
+        TokenKind::Text => Style::default().fg(Color::White),
+    }
+}
+
+/// Instruction text as colored spans (red override for anti-debug lines).
+fn insn_spans(
+    tokens: &[(String, TokenKind)],
+    anti_debug: bool,
+) -> Vec<Span<'static>> {
+    if anti_debug {
+        return vec![Span::styled(
+            tokens.iter().map(|(t, _)| t.as_str()).collect::<String>(),
+            Style::default().fg(BAD),
+        )];
+    }
+    tokens
+        .iter()
+        .map(|(t, k)| Span::styled(t.clone(), token_style(*k)))
+        .collect()
+}
+
+fn score_style(score: u8) -> Style {
+    if score >= 90 {
+        Style::default().fg(BAD).add_modifier(Modifier::BOLD)
+    } else if score >= 70 {
+        Style::default().fg(WARN)
+    } else {
+        Style::default().fg(FG)
+    }
+}
+
+/// Scroll window of `visible` rows keeping `cursor` centred where possible.
+fn window(len: usize, cursor: usize, visible: usize) -> std::ops::Range<usize> {
+    if len == 0 || visible == 0 {
+        return 0..0;
+    }
+    let visible = visible.min(len);
+    let start = cursor
+        .saturating_sub(visible / 2)
+        .min(len - visible);
+    start..start + visible
+}
+
+/// Centre a column of at most `max_w` cells inside `area`.
+fn centered_col(area: Rect, max_w: u16) -> Rect {
+    let w = area.width.min(max_w);
+    Rect {
+        x: area.x + (area.width - w) / 2,
+        y: area.y,
+        width: w,
+        height: area.height,
+    }
 }
 
 pub fn draw(frame: &mut Frame<'_>, app: &App) {
@@ -44,6 +138,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
 }
 
 fn draw_menu(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let col = centered_col(area, 66);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -51,14 +146,12 @@ fn draw_menu(frame: &mut Frame<'_>, app: &App, area: Rect) {
             Constraint::Min(8),
             Constraint::Length(3),
         ])
-        .split(area);
+        .split(col);
 
     let header = Paragraph::new(vec![
         Line::from(Span::styled(
             "VANGUARD-RE",
-            Style::default()
-                .fg(ACCENT)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
             "static malware triage · in-memory quarantine · nothing executed",
@@ -75,7 +168,7 @@ fn draw_menu(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .enumerate()
         .map(|(i, label)| {
             let selected = i == app.menu_index;
-            let prefix = if selected { "▸ " } else { "  " };
+            let prefix = if selected { " ▸ " } else { "   " };
             let style = if selected {
                 Style::default()
                     .fg(Color::Black)
@@ -94,19 +187,14 @@ fn draw_menu(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let list = List::new(items).block(title_block("actions"));
     frame.render_widget(list, chunks[1]);
 
-    let help = Paragraph::new(Line::from(vec![
-        Span::styled("↑↓/jk", Style::default().fg(ACCENT)),
-        Span::styled(" move  ", Style::default().fg(MUTED)),
-        Span::styled("enter", Style::default().fg(ACCENT)),
-        Span::styled(" select  ", Style::default().fg(MUTED)),
-        Span::styled("q", Style::default().fg(ACCENT)),
-        Span::styled(" quit", Style::default().fg(MUTED)),
-    ]))
-    .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(MUTED)));
-    frame.render_widget(help, chunks[2]);
+    frame.render_widget(
+        help_bar(&[("↑↓/jk", "move"), ("enter", "select"), ("1-9", "jump"), ("q", "quit")]),
+        chunks[2],
+    );
 }
 
 fn draw_form(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let col = centered_col(area, 80);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -118,9 +206,9 @@ fn draw_form(frame: &mut Frame<'_>, app: &App, area: Rect) {
             Constraint::Min(1),
             Constraint::Length(3),
         ])
-        .split(area);
+        .split(col);
 
-    let header = Paragraph::new("Investigate — decrypt ZIPs into RAM, triage, YARA, deep-dive")
+    let header = Paragraph::new("Investigate — decrypt ZIPs into RAM, triage, signatures, deep-dive")
         .style(Style::default().fg(FG))
         .block(title_block("investigate"));
     frame.render_widget(header, chunks[0]);
@@ -145,7 +233,7 @@ fn draw_form(frame: &mut Frame<'_>, app: &App, area: Rect) {
     );
     frame.render_widget(
         field(
-            "deep-dives",
+            "deep-dives (1-20)",
             &app.form_deep,
             app.form_field == FormField::Deep,
             false,
@@ -185,25 +273,24 @@ fn draw_form(frame: &mut Frame<'_>, app: &App, area: Rect) {
             Style::default().fg(MUTED),
         )),
     ])
+    .wrap(Wrap { trim: true })
     .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(MUTED)));
     frame.render_widget(tip, chunks[5]);
 
-    let help = Paragraph::new(Line::from(vec![
-        Span::styled("tab", Style::default().fg(ACCENT)),
-        Span::styled(" fields  ", Style::default().fg(MUTED)),
-        Span::styled("enter", Style::default().fg(ACCENT)),
-        Span::styled(" run  ", Style::default().fg(MUTED)),
-        Span::styled("esc", Style::default().fg(ACCENT)),
-        Span::styled(" menu", Style::default().fg(MUTED)),
-    ]))
-    .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(MUTED)));
-    frame.render_widget(help, chunks[6]);
+    frame.render_widget(
+        help_bar(&[
+            ("tab/↑↓", "fields"),
+            ("enter", "run"),
+            ("esc", "menu"),
+        ]),
+        chunks[6],
+    );
 }
 
 fn field<'a>(label: &'a str, value: &'a str, focused: bool, secret: bool) -> Paragraph<'a> {
     let display = if secret && !value.is_empty() {
         "•".repeat(value.chars().count().min(32))
-    } else if value.is_empty() {
+    } else if value.is_empty() && !focused {
         String::from("…")
     } else {
         value.to_string()
@@ -216,11 +303,17 @@ fn field<'a>(label: &'a str, value: &'a str, focused: bool, secret: bool) -> Par
     } else {
         Style::default().fg(FG)
     };
-    Paragraph::new(Line::from(vec![
+    let mut spans = vec![
         Span::styled(format!("{label}: "), Style::default().fg(MUTED)),
         Span::styled(display, style),
-    ]))
-    .block(
+    ];
+    if focused {
+        spans.push(Span::styled(
+            "▏",
+            Style::default().fg(ACCENT).add_modifier(Modifier::SLOW_BLINK),
+        ));
+    }
+    Paragraph::new(Line::from(spans)).block(
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(border)),
@@ -241,9 +334,7 @@ fn draw_running(frame: &mut Frame<'_>, app: &App, area: Rect) {
         Line::from(""),
         Line::from(Span::styled(
             "Working…",
-            Style::default()
-                .fg(ACCENT)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
         Line::from(Span::styled(app.status.clone(), Style::default().fg(FG))),
@@ -273,8 +364,7 @@ fn draw_results(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(4),
-            Constraint::Min(6),
-            Constraint::Min(8),
+            Constraint::Min(10),
             Constraint::Length(3),
         ])
         .split(area);
@@ -284,6 +374,7 @@ fn draw_results(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .rsplit(['/', '\\'])
         .next()
         .unwrap_or(&report.source);
+    let top_score = report.ranking.first().map(|(_, s, _)| *s).unwrap_or(0);
     let header = Paragraph::new(vec![
         Line::from(vec![
             Span::styled("source ", Style::default().fg(MUTED)),
@@ -292,6 +383,8 @@ fn draw_results(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 format!("  ·  {} samples", report.sample_count),
                 Style::default().fg(MUTED),
             ),
+            Span::styled("  ·  top score ", Style::default().fg(MUTED)),
+            Span::styled(format!("{top_score}/100"), score_style(top_score)),
         ]),
         Line::from(Span::styled(
             "static / in-memory · nothing executed",
@@ -301,158 +394,241 @@ fn draw_results(frame: &mut Frame<'_>, app: &App, area: Rect) {
     .block(title_block("results"));
     frame.render_widget(header, chunks[0]);
 
+    // Signal summary is built first so the narrow layout can size its panel.
+    let sig_width = if area.width >= 110 {
+        (area.width as usize * 42 / 100).saturating_sub(2)
+    } else {
+        (area.width as usize).saturating_sub(2)
+    };
+    let summary_lines = signal_lines(report, sig_width);
+
+    let (rank_area, sig_area) = if area.width >= 110 {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+            .split(chunks[1]);
+        (cols[0], cols[1])
+    } else {
+        let sig_h = (summary_lines.len() as u16 + 2).clamp(8, 14);
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(6), Constraint::Length(sig_h)])
+            .split(chunks[1]);
+        (rows[0], rows[1])
+    };
+
+    draw_ranking(frame, app, report, rank_area);
+
+    let summary = Paragraph::new(summary_lines)
+        .wrap(Wrap { trim: false })
+        .block(title_block("signals"));
+    frame.render_widget(summary, sig_area);
+
+    frame.render_widget(
+        help_bar(&[
+            ("↑↓", "select"),
+            ("g/G", "top/bottom"),
+            ("enter", "deep-dive"),
+            ("d", "disasm"),
+            ("esc", "menu"),
+        ]),
+        chunks[2],
+    );
+}
+
+fn draw_ranking(
+    frame: &mut Frame<'_>,
+    app: &App,
+    report: &vanguard_re::investigate::InvestigationReport,
+    area: Rect,
+) {
+    let len = report.ranking.len();
+    let inner_w = (area.width as usize).saturating_sub(2);
+    let visible_h = (area.height as usize).saturating_sub(2);
+
+    // Columns: "#nn " (4) + "sss " (4) + name + " " + label(rest)
+    let name_w = (inner_w * 45 / 100).clamp(16, 42);
+    let label_w = inner_w.saturating_sub(4 + 4 + name_w + 1);
+
     let items: Vec<ListItem> = if report.ranking.is_empty() {
         vec![ListItem::new(Line::from(Span::styled(
             "  No samples could be ranked.",
             Style::default().fg(WARN),
         )))]
     } else {
-        report
-        .ranking
-        .iter()
-        .enumerate()
-        .map(|(i, (path, score, label))| {
-            let selected = i == app.results_index;
-            let name = short_name(path);
-            let score_style = if *score >= 90 {
-                Style::default().fg(BAD).add_modifier(Modifier::BOLD)
-            } else if *score >= 70 {
-                Style::default().fg(WARN)
-            } else {
-                Style::default().fg(FG)
-            };
-            let row = Line::from(vec![
-                Span::styled(
-                    format!("#{:<2} ", i + 1),
-                    if selected {
-                        Style::default().fg(Color::Black)
-                    } else {
-                        Style::default().fg(MUTED)
-                    },
-                ),
-                Span::styled(format!("{score:>3} "), score_style),
-                Span::styled(
-                    format!("{name:<34} "),
-                    if selected {
-                        Style::default()
-                            .fg(Color::Black)
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(Color::White)
-                    },
-                ),
-                Span::styled(
-                    label.clone(),
-                    if selected {
-                        Style::default().fg(Color::Black)
-                    } else {
-                        Style::default().fg(MUTED)
-                    },
-                ),
-            ]);
-            let style = if selected {
-                Style::default().bg(ACCENT)
-            } else {
-                Style::default()
-            };
-            ListItem::new(row).style(style)
-        })
-        .collect()
+        window(len, app.results_index, visible_h)
+            .map(|i| {
+                let (path, score, label) = &report.ranking[i];
+                let selected = i == app.results_index;
+                let name = truncate(&short_name(path), name_w);
+                let row = Line::from(vec![
+                    Span::styled(
+                        format!("#{:<3}", i + 1),
+                        if selected {
+                            Style::default().fg(Color::Black)
+                        } else {
+                            Style::default().fg(MUTED)
+                        },
+                    ),
+                    Span::styled(format!("{score:>3} "), score_style(*score)),
+                    Span::styled(
+                        format!("{name:<name_w$} "),
+                        if selected {
+                            Style::default()
+                                .fg(Color::Black)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(Color::White)
+                        },
+                    ),
+                    Span::styled(
+                        truncate(label, label_w),
+                        if selected {
+                            Style::default().fg(Color::Black)
+                        } else {
+                            Style::default().fg(MUTED)
+                        },
+                    ),
+                ]);
+                let style = if selected {
+                    Style::default().bg(ACCENT)
+                } else {
+                    Style::default()
+                };
+                ListItem::new(row).style(style)
+            })
+            .collect()
     };
 
-    let list = List::new(items).block(title_block("ranking  ·  enter = deep-dive"));
-    frame.render_widget(list, chunks[1]);
+    let title = if len == 0 {
+        "ranking".to_string()
+    } else {
+        format!("ranking {}/{}  ·  enter = deep-dive", app.results_index + 1, len)
+    };
+    frame.render_widget(List::new(items).block(title_block(&title)), area);
+}
 
-    // Side summary: capabilities + YARA + ImpHash siblings
-    let mut summary_lines = Vec::new();
-    summary_lines.push(Line::from(Span::styled(
-        "CAPABILITIES",
-        Style::default()
-            .fg(ACCENT)
-            .add_modifier(Modifier::BOLD),
-    )));
-    let top = report.triage.first();
-    if let Some(t) = top {
+fn signal_lines(
+    report: &vanguard_re::investigate::InvestigationReport,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let section = |t: &str| {
+        Line::from(Span::styled(
+            t.to_string(),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ))
+    };
+    let mut lines = Vec::new();
+
+    lines.push(section("CAPABILITIES  (top sample)"));
+    if let Some(t) = report.triage.first() {
         if t.threat.capabilities.is_empty() {
-            summary_lines.push(Line::from(Span::styled(
+            lines.push(Line::from(Span::styled(
                 "  (none on top sample)",
                 Style::default().fg(MUTED),
             )));
         } else {
             for cap in t.threat.capabilities.iter().take(8) {
-                summary_lines.push(Line::from(Span::styled(
-                    format!("  {:>3}  {:<14}  {}", cap.confidence, cap.id, cap.label),
+                lines.push(Line::from(Span::styled(
+                    truncate(
+                        &format!("  {:>3}  {:<14}  {}", cap.confidence, cap.id, cap.label),
+                        width,
+                    ),
                     Style::default().fg(FG),
                 )));
             }
         }
     }
-    summary_lines.push(Line::from(""));
-    summary_lines.push(Line::from(Span::styled(
-        "YARA",
-        Style::default()
-            .fg(ACCENT)
-            .add_modifier(Modifier::BOLD),
-    )));
+
+    lines.push(Line::from(""));
+    lines.push(section("SIGNATURES"));
     if report.yara_by_sample.is_empty() {
-        summary_lines.push(Line::from(Span::styled(
+        lines.push(Line::from(Span::styled(
             "  (no builtin hits)",
             Style::default().fg(MUTED),
         )));
     } else {
         for (path, hits) in report.yara_by_sample.iter().take(6) {
             let rules: Vec<_> = hits.iter().map(|h| h.rule.as_str()).collect();
-            summary_lines.push(Line::from(Span::styled(
-                format!("  {}  {}", short_name(path), rules.join(", ")),
+            lines.push(Line::from(Span::styled(
+                truncate(
+                    &format!("  {}  {}", short_name(path), rules.join(", ")),
+                    width,
+                ),
                 Style::default().fg(FG),
             )));
         }
     }
-    summary_lines.push(Line::from(""));
-    summary_lines.push(Line::from(Span::styled(
-        "IMPHASH SIBLINGS",
-        Style::default()
-            .fg(ACCENT)
-            .add_modifier(Modifier::BOLD),
-    )));
+
+    lines.push(Line::from(""));
+    lines.push(section("IMPHASH SIBLINGS"));
     let siblings: Vec<_> = report
         .imphash_clusters
         .iter()
         .filter(|c| c.members.len() > 1)
         .collect();
     if siblings.is_empty() {
-        summary_lines.push(Line::from(Span::styled(
+        lines.push(Line::from(Span::styled(
             "  (none in this pack)",
             Style::default().fg(MUTED),
         )));
     } else {
         for c in siblings.iter().take(4) {
-            summary_lines.push(Line::from(Span::styled(
-                format!("  {}  ×{}", c.imphash, c.members.len()),
+            lines.push(Line::from(Span::styled(
+                truncate(&format!("  {}  ×{}", c.imphash, c.members.len()), width),
                 Style::default().fg(FG),
             )));
-            summary_lines.push(Line::from(Span::styled(
-                format!("    {}", c.members.join(" · ")),
+            lines.push(Line::from(Span::styled(
+                truncate(&format!("    {}", c.members.join(" · ")), width),
                 Style::default().fg(MUTED),
             )));
         }
     }
+    lines
+}
 
-    let summary = Paragraph::new(summary_lines)
-        .wrap(Wrap { trim: true })
-        .block(title_block("signals"));
-    frame.render_widget(summary, chunks[2]);
-
-    let help = Paragraph::new(Line::from(vec![
-        Span::styled("↑↓", Style::default().fg(ACCENT)),
-        Span::styled(" select  ", Style::default().fg(MUTED)),
-        Span::styled("enter", Style::default().fg(ACCENT)),
-        Span::styled(" deep-dive  ", Style::default().fg(MUTED)),
-        Span::styled("esc", Style::default().fg(ACCENT)),
-        Span::styled(" menu", Style::default().fg(MUTED)),
-    ]))
-    .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(MUTED)));
-    frame.render_widget(help, chunks[3]);
+fn ioc_lines(
+    iocs: &[vanguard_re::iocs::NetworkIoc],
+    shown: usize,
+    width: usize,
+) -> Vec<Line<'static>> {
+    if iocs.is_empty() {
+        return vec![Line::from(Span::styled(
+            "  (no network indicators)",
+            Style::default().fg(MUTED),
+        ))];
+    }
+    iocs.iter()
+        .take(shown)
+        .map(|ioc| {
+            let kind_style = if ioc.private {
+                Style::default().fg(MUTED)
+            } else if ioc.confidence >= 85 {
+                Style::default().fg(BAD).add_modifier(Modifier::BOLD)
+            } else if ioc.confidence >= 60 {
+                Style::default().fg(WARN)
+            } else {
+                Style::default().fg(FG)
+            };
+            let tag = if ioc.private {
+                format!("{}·priv", ioc.kind.label())
+            } else {
+                ioc.kind.label().to_string()
+            };
+            let val_w = width.saturating_sub(11);
+            Line::from(vec![
+                Span::styled(format!(" {tag:<8} "), kind_style),
+                Span::styled(
+                    truncate(&ioc.value, val_w),
+                    if ioc.private {
+                        Style::default().fg(MUTED)
+                    } else {
+                        Style::default().fg(Color::White)
+                    },
+                ),
+            ])
+        })
+        .collect()
 }
 
 fn draw_deep_dive(frame: &mut Frame<'_>, app: &App, area: Rect, di: usize) {
@@ -463,119 +639,268 @@ fn draw_deep_dive(frame: &mut Frame<'_>, app: &App, area: Rect, di: usize) {
         return;
     };
 
+    let inner_w = (area.width as usize).saturating_sub(2);
+
+    // —— detail: sample identity (left) + threat signals (right) ——
+    let triage = report.triage.iter().find(|t| t.path == dive.path);
+    let left_w = (area.width as usize * 46 / 100).saturating_sub(2);
+
+    let kv = |k: &str, v: String, vs: Style| {
+        Line::from(vec![
+            Span::styled(format!("{k:<8} "), Style::default().fg(MUTED)),
+            Span::styled(v, vs),
+        ])
+    };
+    let left_val_w = left_w.saturating_sub(9);
+    let mut left_lines = vec![Line::from(Span::styled(
+        truncate(&short_name(&dive.path), left_w),
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    ))];
+    if let Some(t) = triage {
+        left_lines.push(kv(
+            "file",
+            format!(
+                "{} · {} · {}",
+                t.binary.format,
+                t.binary.architecture,
+                human_size(t.size)
+            ),
+            Style::default().fg(FG),
+        ));
+    }
+    left_lines.push(kv(
+        "sha256",
+        fit_hash(&dive.sha256, left_val_w),
+        Style::default().fg(FG),
+    ));
+    if let Some(h) = triage.and_then(|t| t.hashes.imphash.as_deref()) {
+        left_lines.push(kv(
+            "imphash",
+            fit_hash(h, left_val_w),
+            Style::default().fg(FG),
+        ));
+    }
+    if let Some(t) = triage {
+        for hint in t.packer_hints.iter().take(2) {
+            left_lines.push(kv(
+                "packer",
+                truncate(hint, left_val_w),
+                Style::default().fg(WARN),
+            ));
+        }
+    }
+
+    // Right column: "<label>  ━━━━━━━─── nnn" rows sharing one label width.
+    let right_w = inner_w.saturating_sub(left_w + 2);
+    let label_w = right_w.saturating_sub(17).clamp(14, 24);
+    let gauge = |label: &str, value: u8, denom: &str, style: Style| {
+        Line::from(vec![
+            Span::styled(
+                format!("{:<label_w$} ", truncate(label, label_w)),
+                Style::default().fg(Color::White),
+            ),
+            Span::styled(conf_bar(value, 10), style),
+            Span::styled(format!(" {value:>3}{denom}"), style),
+        ])
+    };
+
+    let mut right_lines = vec![gauge(
+        "risk",
+        dive.score,
+        "/100",
+        score_style(dive.score).add_modifier(Modifier::BOLD),
+    )];
+    if dive.capabilities.is_empty() {
+        right_lines.push(Line::from(Span::styled(
+            "(no capability tags)",
+            Style::default().fg(MUTED),
+        )));
+    } else {
+        for cap in dive.capabilities.iter().take(6) {
+            let bar_style = if cap.confidence >= 80 {
+                Style::default().fg(BAD)
+            } else if cap.confidence >= 50 {
+                Style::default().fg(WARN)
+            } else {
+                Style::default().fg(FG)
+            };
+            right_lines.push(gauge(&cap.label, cap.confidence, "", bar_style));
+        }
+    }
+    right_lines.push(Line::from(""));
+    let behaviors: Vec<&str> = triage
+        .map(|t| {
+            t.threat
+                .behaviors
+                .iter()
+                .map(|b| b.name.as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    if !behaviors.is_empty() {
+        right_lines.push(Line::from(vec![
+            Span::styled("behaviors ", Style::default().fg(MUTED)),
+            Span::styled(
+                truncate(&behaviors.join(" · "), right_w.saturating_sub(10)),
+                Style::default().fg(FG),
+            ),
+        ]));
+    }
+    right_lines.push(Line::from(vec![
+        Span::styled("sigs      ", Style::default().fg(MUTED)),
+        if dive.yara.is_empty() {
+            Span::styled("(no builtin hits)", Style::default().fg(MUTED))
+        } else {
+            Span::styled(
+                truncate(
+                    &dive
+                        .yara
+                        .iter()
+                        .map(|y| y.rule.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" · "),
+                    right_w.saturating_sub(10),
+                ),
+                Style::default().fg(WARN),
+            )
+        },
+    ]));
+    right_lines.push(Line::from(vec![
+        Span::styled("crypto    ", Style::default().fg(MUTED)),
+        if dive.crypto.is_empty() {
+            Span::styled("(none detected)", Style::default().fg(MUTED))
+        } else {
+            Span::styled(
+                truncate(
+                    &dive
+                        .crypto
+                        .iter()
+                        .map(|c| c.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" · "),
+                    right_w.saturating_sub(10),
+                ),
+                Style::default().fg(Color::LightGreen),
+            )
+        },
+    ]));
+
+    // Every row is pre-truncated to one line, so heights are exact.
+    let meta_h = (left_lines.len().max(right_lines.len()) as u16 + 2).clamp(8, 14);
+
+    // —— strings + network IOCs share a row, each sized to content ——
+    let shown_strings = dive.interesting_strings.len().min(14);
+    let shown_iocs = dive.network_iocs.len().min(10);
+    let row_h = (shown_strings.max(shown_iocs).max(1) as u16 + 2).min(16);
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(7),
-            Constraint::Percentage(28),
-            Constraint::Min(8),
+            Constraint::Length(meta_h),
+            Constraint::Length(row_h),
+            Constraint::Min(6),
             Constraint::Length(3),
         ])
         .split(area);
 
-    let meta = Paragraph::new(vec![
-        Line::from(vec![
-            Span::styled(
-                format!("DEEP-DIVE {}/{}  ", di + 1, report.deep_dives.len()),
-                Style::default().fg(BAD).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                short_name(&dive.path),
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("  {}/100", dive.score),
-                if dive.score >= 90 {
-                    Style::default().fg(BAD).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(WARN)
-                },
-            ),
-        ]),
-        Line::from(Span::styled(
-            format!("sha256  {}", dive.sha256),
-            Style::default().fg(MUTED),
-        )),
-        Line::from(Span::styled(
-            format!("behaviors  {}", dive.reason.replace(", ", " · ")),
-            Style::default().fg(FG),
-        )),
-        Line::from(Span::styled(
-            format!(
-                "caps  {}",
-                if dive.capabilities.is_empty() {
-                    "(none)".into()
-                } else {
-                    dive.capabilities
-                        .iter()
-                        .map(|c| format!("{}({})", c.id, c.confidence))
-                        .collect::<Vec<_>>()
-                        .join(" · ")
-                }
-            ),
-            Style::default().fg(WARN),
-        )),
-        Line::from(Span::styled(
-            format!(
-                "yara  {}",
-                dive.yara
-                    .iter()
-                    .map(|y| y.rule.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" · ")
-            ),
-            Style::default().fg(FG),
-        )),
-    ])
-    .block(title_block("detail"));
-    frame.render_widget(meta, chunks[0]);
+    let detail_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(46), Constraint::Percentage(54)])
+        .split(chunks[0]);
+    frame.render_widget(
+        Paragraph::new(left_lines).block(title_block(&format!(
+            "sample  ·  deep-dive {}/{}",
+            di + 1,
+            report.deep_dives.len()
+        ))),
+        detail_cols[0],
+    );
+    frame.render_widget(
+        Paragraph::new(right_lines).block(title_block("threat signals")),
+        detail_cols[1],
+    );
 
-    let mut string_lines = vec![Line::from(Span::styled(
-        "strings",
-        Style::default()
-            .fg(ACCENT)
-            .add_modifier(Modifier::BOLD),
-    ))];
+    let row_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(chunks[1]);
+    let str_w = (row_cols[0].width as usize).saturating_sub(2);
+    let ioc_w = (row_cols[1].width as usize).saturating_sub(2);
+
+    let mut string_lines = Vec::new();
     if dive.interesting_strings.is_empty() {
         string_lines.push(Line::from(Span::styled(
             "  (none flagged)",
             Style::default().fg(MUTED),
         )));
     } else {
-        for s in dive.interesting_strings.iter().take(12) {
-            let val = if s.value.len() > 70 {
-                format!("{}…", &s.value[..70])
-            } else {
-                s.value.clone()
-            };
-            string_lines.push(Line::from(Span::styled(
-                format!("  {:>8x}  {val}", s.offset),
-                Style::default().fg(FG),
-            )));
+        for s in dive.interesting_strings.iter().take(shown_strings) {
+            string_lines.push(Line::from(vec![
+                Span::styled(format!(" {:>7x}  ", s.offset), Style::default().fg(MUTED)),
+                Span::styled(
+                    truncate(&s.value, str_w.saturating_sub(11)),
+                    Style::default().fg(FG),
+                ),
+            ]));
         }
     }
+    let strings_title = format!(
+        "interesting strings ({}/{})",
+        shown_strings,
+        dive.interesting_strings.len()
+    );
     frame.render_widget(
-        Paragraph::new(string_lines).block(title_block("interesting strings")),
-        chunks[1],
+        Paragraph::new(string_lines).block(title_block(&strings_title)),
+        row_cols[0],
     );
 
+    frame.render_widget(
+        Paragraph::new(ioc_lines(&dive.network_iocs, shown_iocs, ioc_w))
+            .block(title_block(&format!(
+                "network IOCs ({}/{})",
+                shown_iocs,
+                dive.network_iocs.len()
+            ))),
+        row_cols[1],
+    );
+
+    // —— entry disassembly (fills remaining space) ——
     let mut disasm_lines = Vec::new();
+    let disasm_cap = (chunks[2].height as usize).saturating_sub(3);
     if let Some(d) = &dive.disasm {
         disasm_lines.push(Line::from(Span::styled(
             format!(
-                "disasm  {} @ {:#x}  ·  {} functions  ·  press d to explore",
+                "{} @ {:#x}  ·  {} functions  ·  press d to explore",
                 d.architecture,
                 d.start_address,
                 d.functions.len()
             ),
-            Style::default()
-                .fg(ACCENT)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         )));
+        if !d.insights.is_empty() {
+            let mut spans = vec![Span::styled(
+                "techniques  ",
+                Style::default().fg(MUTED),
+            )];
+            let names = d
+                .insights
+                .iter()
+                .map(|i| i.id.as_str())
+                .collect::<Vec<_>>()
+                .join(" · ");
+            spans.push(Span::styled(
+                truncate(&names, inner_w.saturating_sub(13)),
+                Style::default().fg(BAD).add_modifier(Modifier::BOLD),
+            ));
+            disasm_lines.push(Line::from(spans));
+        }
         let mut pad = 0usize;
-        for line in d.instructions.iter().take(40) {
+        for line in d.instructions.iter() {
+            if disasm_lines.len() > disasm_cap {
+                break;
+            }
             let t = line.text.to_ascii_lowercase();
             let is_pad = t == "add [eax],al" || t == "add [rax],al" || t == "nop";
             if is_pad && !line.anti_debug {
@@ -591,9 +916,12 @@ fn draw_deep_dive(frame: &mut Frame<'_>, app: &App, area: Rect, di: usize) {
                     format!("  {:#010x}  ", line.address),
                     Style::default().fg(MUTED),
                 ),
-                Span::styled(format!("{:<14}  ", truncate(&line.bytes, 14)), Style::default().fg(MUTED)),
-                Span::styled(line.text.clone(), Style::default().fg(Color::White)),
+                Span::styled(
+                    format!("{:<14}  ", truncate(&line.bytes, 14)),
+                    Style::default().fg(MUTED),
+                ),
             ];
+            spans.extend(insn_spans(&line.tokens, line.anti_debug));
             if line.anti_debug {
                 spans.push(Span::styled(
                     "  anti-debug",
@@ -613,23 +941,18 @@ fn draw_deep_dive(frame: &mut Frame<'_>, app: &App, area: Rect, di: usize) {
         chunks[2],
     );
 
-    let help = Paragraph::new(Line::from(vec![
-        Span::styled("↑↓", Style::default().fg(ACCENT)),
-        Span::styled(" next deep-dive  ", Style::default().fg(MUTED)),
-        Span::styled("d/enter", Style::default().fg(ACCENT)),
-        Span::styled(" functions  ", Style::default().fg(MUTED)),
-        Span::styled("b", Style::default().fg(ACCENT)),
-        Span::styled(" ranking  ", Style::default().fg(MUTED)),
-        Span::styled("esc", Style::default().fg(ACCENT)),
-        Span::styled(" ranking", Style::default().fg(MUTED)),
-    ]))
-    .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(MUTED)));
-    frame.render_widget(help, chunks[3]);
+    frame.render_widget(
+        help_bar(&[
+            ("↑↓", "next deep-dive"),
+            ("d/enter", "function map"),
+            ("b/esc", "ranking"),
+        ]),
+        chunks[3],
+    );
 }
 
 fn draw_disasm_explorer(frame: &mut Frame<'_>, app: &App, area: Rect) {
     use vanguard_re::disasm::FlowKind;
-    use vanguard_re::investigate::short_name;
 
     let Some(nav) = &app.disasm_nav else {
         return;
@@ -646,10 +969,13 @@ fn draw_disasm_explorer(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(8), Constraint::Length(3)])
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(8),
+            Constraint::Length(3),
+        ])
         .split(area);
 
-    let fn_count = d.functions.len();
     let cur = d.functions.get(nav.fn_index);
     let cur_name = cur.map(|f| f.name.as_str()).unwrap_or("listing");
     let cur_interest = cur.map(|f| f.interest).unwrap_or(0);
@@ -658,25 +984,30 @@ fn draw_disasm_explorer(frame: &mut Frame<'_>, app: &App, area: Rect) {
             .clusters
             .iter()
             .find(|c| c.id == id)
-            .map(|c| format!("filter:c{id}/{}", c.label))
-            .unwrap_or_else(|| format!("filter:c{id}")),
+            .map(|c| format!("filter c{id}:{}", c.label))
+            .unwrap_or_else(|| format!("filter c{id}")),
         None => format!("{} clusters", d.clusters.len()),
     };
     let header = Paragraph::new(Line::from(vec![
         Span::styled(
-            "FUNCTION MAP  ",
+            short_name(&dive.path),
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" ▸ ", Style::default().fg(MUTED)),
+        Span::styled(
+            cur_name.to_string(),
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(short_name(&dive.path), Style::default().fg(Color::White)),
         Span::styled(
             format!(
-                "  ·  {fn_count} funcs  ·  {cur_name}★{cur_interest}  ·  {filter_note}  ·  {}",
+                "  ★{cur_interest}  ·  {} funcs  ·  {filter_note}  ·  {}",
+                d.functions.len(),
                 d.architecture
             ),
             Style::default().fg(MUTED),
         ),
     ]))
-    .block(title_block("disasm"));
+    .block(title_block("function map"));
     frame.render_widget(header, chunks[0]);
 
     let body = Layout::default()
@@ -684,60 +1015,7 @@ fn draw_disasm_explorer(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .constraints([Constraint::Percentage(32), Constraint::Percentage(68)])
         .split(chunks[1]);
 
-    // —— function list (interest-sorted, optional cluster filter) ——
-    let fn_items: Vec<ListItem> = if d.functions.is_empty() {
-        vec![ListItem::new(Line::from(Span::styled(
-            "  (linear listing only)",
-            Style::default().fg(MUTED),
-        )))]
-    } else {
-        d.functions
-            .iter()
-            .enumerate()
-            .filter(|(_, f)| nav.cluster_filter.map_or(true, |c| f.cluster_id == c))
-            .map(|(i, f)| {
-                let selected = i == nav.fn_index;
-                let prefix = if selected { "▸ " } else { "  " };
-                let label = format!(
-                    "{prefix}{:>3}  c{} {:<14} {:#x}",
-                    f.interest,
-                    f.cluster_id,
-                    truncate(&f.name, 14),
-                    f.start
-                );
-                let style = if selected && nav.focus == DisasmFocus::Functions {
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(ACCENT)
-                        .add_modifier(Modifier::BOLD)
-                } else if selected {
-                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
-                } else if f.interest >= 70 {
-                    Style::default().fg(WARN)
-                } else {
-                    Style::default().fg(FG)
-                };
-                ListItem::new(Line::from(Span::styled(label, style)))
-            })
-            .collect()
-    };
-    let fn_border = if nav.focus == DisasmFocus::Functions {
-        ACCENT
-    } else {
-        MUTED
-    };
-    frame.render_widget(
-        List::new(fn_items).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(fn_border))
-                .title(Span::styled(
-                    " functions ★interest · c# cluster ",
-                    Style::default().fg(fn_border).add_modifier(Modifier::BOLD),
-                )),
-        ),
-        body[0],
-    );
+    draw_fn_pane(frame, nav, d, body[0]);
 
     // —— instruction listing ——
     let (span_start, span_end) = if let Some(f) = d.functions.get(nav.fn_index) {
@@ -747,11 +1025,10 @@ fn draw_disasm_explorer(frame: &mut Frame<'_>, app: &App, area: Rect) {
     };
     let visible_h = body[1].height.saturating_sub(2) as usize;
     let cursor = nav.insn_cursor;
-    let scroll = cursor.saturating_sub(visible_h.saturating_sub(1) / 2);
+    let total = span_end.saturating_sub(span_start) + 1;
 
     let mut listing_lines: Vec<Line> = Vec::new();
-    let total = span_end.saturating_sub(span_start) + 1;
-    for rel in scroll..total.min(scroll + visible_h.max(1)) {
+    for rel in window(total, cursor, visible_h) {
         let idx = span_start + rel;
         let Some(line) = d.instructions.get(idx) else {
             break;
@@ -789,74 +1066,144 @@ fn draw_disasm_explorer(frame: &mut Frame<'_>, app: &App, area: Rect) {
             ""
         };
 
-        let text = format!(
-            "{marker}{:#010x}  {:<12}  {}{target_note}{flag}",
+        let prefix = format!(
+            "{marker}{:#010x}  {:<12}  ",
             line.address,
             truncate(&line.bytes, 12),
-            line.text,
         );
-        let row_style = if selected && nav.focus == DisasmFocus::Listing {
-            Style::default().fg(Color::Black).bg(ACCENT)
-        } else if selected {
-            Style::default().fg(ACCENT)
-        } else if line.anti_debug {
-            Style::default().fg(BAD)
-        } else if line.flow == FlowKind::Call {
-            Style::default().fg(WARN)
-        } else if line.flow == FlowKind::Return {
-            Style::default().fg(MUTED)
+        // Selected rows keep a solid highlight for readability; everything
+        // else gets per-token syntax colors.
+        if selected {
+            let row_style = if nav.focus == DisasmFocus::Listing {
+                Style::default().fg(Color::Black).bg(ACCENT)
+            } else {
+                Style::default().fg(ACCENT)
+            };
+            listing_lines.push(Line::from(Span::styled(
+                format!("{prefix}{}{target_note}{flag}", line.text),
+                row_style,
+            )));
         } else {
-            Style::default().fg(Color::White)
-        };
-        listing_lines.push(Line::from(Span::styled(text, row_style)));
+            let mut spans = vec![Span::styled(prefix, Style::default().fg(MUTED))];
+            spans.extend(insn_spans(&line.tokens, line.anti_debug));
+            if !target_note.is_empty() {
+                spans.push(Span::styled(
+                    target_note,
+                    Style::default().fg(Color::LightGreen),
+                ));
+            }
+            if !flag.is_empty() {
+                let flag_style = if line.anti_debug {
+                    Style::default().fg(BAD).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(MUTED)
+                };
+                spans.push(Span::styled(flag.to_string(), flag_style));
+            }
+            listing_lines.push(Line::from(spans));
+        }
     }
 
-    let list_border = if nav.focus == DisasmFocus::Listing {
-        ACCENT
-    } else {
-        MUTED
-    };
+    let listing_title = format!("listing {}/{}  ·  enter = follow call", cursor + 1, total);
     frame.render_widget(
-        Paragraph::new(listing_lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(list_border))
-                .title(Span::styled(
-                    " listing  ·  enter = follow call ",
-                    Style::default().fg(list_border).add_modifier(Modifier::BOLD),
-                )),
-        ),
+        Paragraph::new(listing_lines).block(pane_block(
+            &listing_title,
+            nav.focus == DisasmFocus::Listing,
+        )),
         body[1],
     );
 
-    let help = Paragraph::new(Line::from(vec![
-        Span::styled("↑↓", Style::default().fg(ACCENT)),
-        Span::styled(" step  ", Style::default().fg(MUTED)),
-        Span::styled("tab", Style::default().fg(ACCENT)),
-        Span::styled(" pane  ", Style::default().fg(MUTED)),
-        Span::styled("enter", Style::default().fg(ACCENT)),
-        Span::styled(" follow  ", Style::default().fg(MUTED)),
-        Span::styled("u", Style::default().fg(ACCENT)),
-        Span::styled(" back  ", Style::default().fg(MUTED)),
-        Span::styled("[]", Style::default().fg(ACCENT)),
-        Span::styled(" fn  ", Style::default().fg(MUTED)),
-        Span::styled("c", Style::default().fg(ACCENT)),
-        Span::styled(" cluster  ", Style::default().fg(MUTED)),
-        Span::styled("esc", Style::default().fg(ACCENT)),
-        Span::styled(" close", Style::default().fg(MUTED)),
-    ]))
-    .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(MUTED)));
-    frame.render_widget(help, chunks[2]);
+    frame.render_widget(
+        help_bar(&[
+            ("↑↓", "step"),
+            ("g/G", "top/bottom"),
+            ("tab", "pane"),
+            ("enter", "follow"),
+            ("u", "back"),
+            ("[]", "fn"),
+            ("c", "cluster"),
+            ("esc", "close"),
+        ]),
+        chunks[2],
+    );
+}
+
+fn draw_fn_pane(
+    frame: &mut Frame<'_>,
+    nav: &super::app::DisasmNav,
+    d: &vanguard_re::disasm::DisasmReport,
+    area: Rect,
+) {
+    let focused = nav.focus == DisasmFocus::Functions;
+    let inner_w = (area.width as usize).saturating_sub(2);
+    let visible_h = (area.height as usize).saturating_sub(2);
+    // Row: "▸ " + "★nnn " + "c# " + name + " " + addr(~10)
+    let name_w = inner_w.saturating_sub(22).clamp(8, 30);
+
+    if d.functions.is_empty() {
+        frame.render_widget(
+            List::new(vec![ListItem::new(Line::from(Span::styled(
+                "  (linear listing only)",
+                Style::default().fg(MUTED),
+            )))])
+            .block(pane_block("functions", focused)),
+            area,
+        );
+        return;
+    }
+
+    let visible: Vec<usize> = d
+        .functions
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| nav.cluster_filter.map_or(true, |c| f.cluster_id == c))
+        .map(|(i, _)| i)
+        .collect();
+    let sel_pos = visible
+        .iter()
+        .position(|&i| i == nav.fn_index)
+        .unwrap_or(0);
+
+    let items: Vec<ListItem> = window(visible.len(), sel_pos, visible_h)
+        .map(|pos| {
+            let i = visible[pos];
+            let f = &d.functions[i];
+            let selected = i == nav.fn_index;
+            let prefix = if selected { "▸ " } else { "  " };
+            let label = format!(
+                "{prefix}★{:<3} c{} {:<name_w$} {:#x}",
+                f.interest,
+                f.cluster_id,
+                truncate(&f.name, name_w),
+                f.start,
+            );
+            let style = if selected && focused {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(ACCENT)
+                    .add_modifier(Modifier::BOLD)
+            } else if selected {
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+            } else if f.interest >= 70 {
+                Style::default().fg(WARN)
+            } else {
+                Style::default().fg(FG)
+            };
+            ListItem::new(Line::from(Span::styled(label, style)))
+        })
+        .collect();
+
+    let title = format!("functions {}/{}", sel_pos + 1, visible.len());
+    frame.render_widget(List::new(items).block(pane_block(&title, focused)), area);
 }
 
 fn draw_about(frame: &mut Frame<'_>, area: Rect) {
+    let col = centered_col(area, 80);
     let policy = containment_policy();
     let lines = vec![
         Line::from(Span::styled(
             "Vanguard-RE",
-            Style::default()
-                .fg(ACCENT)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
             "Speed · Accuracy · Exploit Immunity",
@@ -896,7 +1243,7 @@ fn draw_about(frame: &mut Frame<'_>, area: Rect) {
     let widget = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
         .block(title_block("about"));
-    frame.render_widget(widget, area);
+    frame.render_widget(widget, col);
 }
 
 fn draw_error(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -938,10 +1285,38 @@ fn centered(area: Rect, percent_x: u16, height: u16) -> Rect {
         .split(popup[1])[1]
 }
 
+/// `━━━━━━━───`-style confidence/score bar. Thin line glyphs stay readable
+/// and never merge into a solid blob across adjacent rows like `█` does.
+fn conf_bar(value: u8, width: usize) -> String {
+    let filled = (value as usize * width).div_ceil(100).min(width);
+    format!("{}{}", "━".repeat(filled), "─".repeat(width - filled))
+}
+
+/// Fit a hex hash on one line: head…tail when too long (hex is ASCII-safe).
+fn fit_hash(h: &str, max: usize) -> String {
+    if h.len() <= max || max < 16 {
+        h.to_string()
+    } else {
+        format!("{}…{}", &h[..max.saturating_sub(9)], &h[h.len() - 8..])
+    }
+}
+
+fn human_size(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// Char-safe truncation with an ellipsis (never slices mid-UTF-8).
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    if s.chars().count() <= max {
         s.to_string()
     } else {
-        format!("{}…", &s[..max.saturating_sub(1)])
+        let cut: String = s.chars().take(max.saturating_sub(1)).collect();
+        format!("{cut}…")
     }
 }

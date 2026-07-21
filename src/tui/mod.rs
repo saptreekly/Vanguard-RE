@@ -131,6 +131,8 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
                 KeyCode::Char('b') => app.back_to_results_list(),
                 KeyCode::PageUp => app.results_page(-10),
                 KeyCode::PageDown => app.results_page(10),
+                KeyCode::Char('g') | KeyCode::Home => app.results_page(isize::MIN / 2),
+                KeyCode::Char('G') | KeyCode::End => app.results_page(isize::MAX / 2),
                 _ => {}
             },
             Screen::DisasmExplorer => match key.code {
@@ -141,6 +143,8 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
                 KeyCode::Down | KeyCode::Char('j') => app.disasm_move(1),
                 KeyCode::PageUp => app.disasm_move(-16),
                 KeyCode::PageDown => app.disasm_move(16),
+                KeyCode::Char('g') | KeyCode::Home => app.disasm_move(isize::MIN / 2),
+                KeyCode::Char('G') | KeyCode::End => app.disasm_move(isize::MAX / 2),
                 KeyCode::Char('[') => app.disasm_next_function(-1),
                 KeyCode::Char(']') => app.disasm_next_function(1),
                 KeyCode::Char('c') => app.disasm_cycle_cluster_filter(),

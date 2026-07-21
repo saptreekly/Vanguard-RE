@@ -1,12 +1,16 @@
 //! High-speed static disassembler (iced-x86) + function recovery + strings.
 
+mod analysis;
 mod cluster;
+
+pub use analysis::CodeInsight;
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{bail, Context, Result};
 use iced_x86::{
-    Decoder, DecoderOptions, FlowControl, Formatter, Instruction, NasmFormatter, OpKind,
+    Decoder, DecoderOptions, FlowControl, Formatter, FormatterOutput, FormatterTextKind,
+    Instruction, NasmFormatter, OpKind,
 };
 use crate::triage::{parse_binary, BinaryFormat, ParsedBinary};
 
@@ -23,16 +27,73 @@ pub enum FlowKind {
     Other,
 }
 
+/// Coarse token classes for syntax highlighting (mapped from iced-x86).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenKind {
+    Mnemonic,
+    Register,
+    Number,
+    Keyword,
+    Punct,
+    Address,
+    Text,
+}
+
 #[derive(Debug, Clone)]
 pub struct DisasmLine {
     pub address: u64,
     pub bytes: String,
     pub text: String,
+    /// Formatter tokens for syntax highlighting; concatenation equals `text`.
+    pub tokens: Vec<(String, TokenKind)>,
     pub anti_debug: bool,
     pub flow: FlowKind,
     /// Near/branch target when statically resolvable.
     pub branch_target: Option<u64>,
     pub is_function_start: bool,
+}
+
+/// Collects formatter output as plain text plus typed tokens.
+#[derive(Default)]
+struct TokenSink {
+    text: String,
+    tokens: Vec<(String, TokenKind)>,
+}
+
+impl TokenSink {
+    fn clear(&mut self) {
+        self.text.clear();
+        self.tokens.clear();
+    }
+}
+
+impl FormatterOutput for TokenSink {
+    fn write(&mut self, text: &str, kind: FormatterTextKind) {
+        self.text.push_str(text);
+        let k = match kind {
+            FormatterTextKind::Mnemonic | FormatterTextKind::Prefix => TokenKind::Mnemonic,
+            FormatterTextKind::Register => TokenKind::Register,
+            FormatterTextKind::Number => TokenKind::Number,
+            FormatterTextKind::Keyword
+            | FormatterTextKind::Directive
+            | FormatterTextKind::Decorator
+            | FormatterTextKind::SelectorValue => TokenKind::Keyword,
+            FormatterTextKind::Operator | FormatterTextKind::Punctuation => TokenKind::Punct,
+            FormatterTextKind::LabelAddress
+            | FormatterTextKind::FunctionAddress
+            | FormatterTextKind::Label
+            | FormatterTextKind::Function => TokenKind::Address,
+            _ => TokenKind::Text,
+        };
+        // Merge adjacent same-kind fragments (whitespace, multi-part operands).
+        if let Some((last, lk)) = self.tokens.last_mut() {
+            if *lk == k {
+                last.push_str(text);
+                return;
+            }
+        }
+        self.tokens.push((text.to_string(), k));
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -79,6 +140,8 @@ pub struct DisasmReport {
     /// Visual clustering layer over recovered functions.
     pub clusters: Vec<FunctionCluster>,
     pub strings: Vec<ExtractedString>,
+    /// Automated code-pattern findings (PEB access, API hashing, XOR loops, …).
+    pub insights: Vec<CodeInsight>,
 }
 
 /// Anti-debug / anti-analysis mnemonics we flag during linear decode.
@@ -199,6 +262,7 @@ pub fn disassemble(
 
     let mut instructions = Vec::with_capacity(count);
     let mut instr = Instruction::default();
+    let mut sink = TokenSink::default();
 
     for _ in 0..count {
         if !decoder.can_decode() {
@@ -209,8 +273,8 @@ pub fn disassemble(
             break;
         }
 
-        let mut text = String::new();
-        formatter.format(&instr, &mut text);
+        sink.clear();
+        formatter.format(&instr, &mut sink);
 
         let start_idx = (instr.ip() - ip) as usize + file_off;
         let end_idx = start_idx + instr.len();
@@ -218,11 +282,12 @@ pub fn disassemble(
         let bytes = hex::encode(raw);
 
         let (flow, branch_target) = classify_flow(&instr);
-        let anti = is_anti_debug(&text);
+        let anti = is_anti_debug(&sink.text);
         instructions.push(DisasmLine {
             address: instr.ip(),
             bytes,
-            text,
+            text: sink.text.clone(),
+            tokens: std::mem::take(&mut sink.tokens),
             anti_debug: anti,
             flow,
             branch_target,
@@ -238,6 +303,7 @@ pub fn disassemble(
     };
     rank_functions(&instructions, &mut functions, &strings, start);
     let clusters = cluster_functions(&instructions, &mut functions);
+    let insights = analysis::analyze(&instructions);
 
     // Surface interesting functions first (keep entry near top via interest bump).
     functions.sort_by(|a, b| {
@@ -254,6 +320,7 @@ pub fn disassemble(
         functions,
         clusters,
         strings,
+        insights,
     })
 }
 
@@ -510,67 +577,214 @@ fn extract_strings_with_xrefs(data: &[u8], instructions: &[DisasmLine]) -> Vec<E
         s.xrefs.dedup();
     }
 
-    strings.truncate(200);
+    // Prefer strings that have code xrefs, then length — never the first-N of file order.
+    strings.sort_by(|a, b| {
+        b.xrefs
+            .len()
+            .cmp(&a.xrefs.len())
+            .then(b.value.len().cmp(&a.value.len()))
+    });
+    strings.truncate(500);
     strings
 }
 
 /// Extract ASCII + UTF-16LE strings without disassembly.
+///
+/// Packed / high-entropy binaries produce thousands of short printable runs.
+/// We score candidates and keep the best `cap` rather than truncating in file
+/// order (which buried WannaCry-style C2 domains under packer noise).
 pub fn extract_strings_only(data: &[u8]) -> Vec<ExtractedString> {
-    let mut strings = extract_ascii_strings(data, 5);
-    strings.extend(extract_utf16le_strings(data, 5));
-    strings.truncate(2000);
+    extract_strings_ranked(data, 8000)
+}
+
+/// Ranked string extraction with an explicit retention cap.
+pub fn extract_strings_ranked(data: &[u8], cap: usize) -> Vec<ExtractedString> {
+    // min_len 6 skips most 5-char entropy noise; UTF-16 same.
+    let mut strings = extract_ascii_strings(data, 6);
+    strings.extend(extract_utf16le_strings(data, 6));
+
+    strings.sort_by(|a, b| {
+        string_quality(&b.value)
+            .cmp(&string_quality(&a.value))
+            .then(b.value.len().cmp(&a.value.len()))
+            .then(a.offset.cmp(&b.offset))
+    });
+    strings.dedup_by(|a, b| a.value == b.value);
+    strings.truncate(cap);
     strings
+}
+
+/// Higher = more likely a real analyst-useful string (vs packer printable noise).
+fn string_quality(s: &str) -> u32 {
+    let bytes = s.as_bytes();
+    let len = bytes.len() as u32;
+    if len < 6 {
+        return 0;
+    }
+    let letters = bytes.iter().filter(|b| b.is_ascii_alphabetic()).count() as u32;
+    let digits = bytes.iter().filter(|b| b.is_ascii_digit()).count() as u32;
+    let spaces = bytes.iter().filter(|&&b| b == b' ').count() as u32;
+    let punct = len.saturating_sub(letters + digits + spaces);
+    let letter_ratio = letters * 100 / len;
+
+    let mut score = len.min(80);
+    // Prefer alphabetic content (domains, paths, API names).
+    score += letter_ratio / 2;
+    // Paths / URLs / registry keys.
+    if s.contains('\\') || s.contains('/') || s.contains(':') {
+        score += 40;
+    }
+    if s.contains('.') {
+        score += 15;
+    }
+    // DLL / EXE / service-ish.
+    let lower = s.to_ascii_lowercase();
+    if lower.ends_with(".dll")
+        || lower.ends_with(".exe")
+        || lower.ends_with(".sys")
+        || lower.contains("http")
+        || lower.contains(".onion")
+        || lower.contains("bitcoin")
+        || lower.contains("wallet")
+        || lower.contains("encrypt")
+        || lower.contains("ransom")
+    {
+        score += 80;
+    }
+    // Penalize mostly-digit or mostly-punct runs (entropy leftovers).
+    if digits * 2 > letters {
+        score = score.saturating_sub(30);
+    }
+    if punct * 2 > letters + digits {
+        score = score.saturating_sub(40);
+    }
+    // Very long random alphabetic domains (kill-switch style) are valuable.
+    if letter_ratio >= 85 && len >= 24 && s.contains('.') {
+        score += 50;
+    }
+    score
 }
 
 /// Keep IOC-ish / analyst-interesting strings only.
 pub fn interesting_strings(all: &[ExtractedString]) -> Vec<ExtractedString> {
-    all.iter()
+    let mut out: Vec<_> = all
+        .iter()
         .filter(|s| is_interesting(&s.value))
         .cloned()
-        .take(80)
-        .collect()
+        .collect();
+    out.sort_by(|a, b| {
+        string_quality(&b.value)
+            .cmp(&string_quality(&a.value))
+            .then(b.value.len().cmp(&a.value.len()))
+    });
+    out.truncate(120);
+    out
 }
 
 fn is_interesting(s: &str) -> bool {
     let lower = s.to_ascii_lowercase();
-    if s.len() < 6 || s.len() > 240 {
+    if s.len() < 6 || s.len() > 400 {
         return false;
     }
     if lower.starts_with("abcdefghijklmnopqrstuvwxyz")
         || lower.contains("runtime error")
         || lower.contains("this program cannot be run")
+        || lower.contains("schemas.microsoft.com")
+        || lower.contains("xmlns")
     {
         return false;
     }
-    lower.contains("http://")
-        || lower.contains("https://")
-        || lower.contains("ftp://")
-        || lower.contains(".onion")
-        || lower.contains("discord.com")
-        || lower.contains("telegram")
-        || lower.contains("webhook")
-        || lower.contains("electrora")
-        || lower.contains("keylog")
-        || lower.contains("screenshot")
-        || lower.contains("webcam")
-        || lower.contains("password")
-        || lower.contains("wallet")
-        || lower.contains("cmd.exe")
-        || lower.contains("powershell")
-        || lower.contains("appdata")
-        || lower.contains("\\temp")
-        || lower.contains("/temp")
-        || lower.contains(".exe")
-        || lower.contains(".dll")
-        || lower.contains("hkey_")
-        || lower.contains("software\\")
-        || lower.contains("mozill")
-        || lower.contains("chrome")
-        || lower.contains("login data")
-        || lower.contains("user-agent")
-        || lower.contains("api/")
-        || looks_like_ipv4(s)
-        || looks_like_domain(s)
+    // Import / module names (KERNEL32.dll etc.).
+    if lower.ends_with(".dll")
+        || lower.ends_with(".exe")
+        || lower.ends_with(".sys")
+        || lower.ends_with(".bat")
+        || lower.ends_with(".cmd")
+        || lower.ends_with(".ps1")
+        || lower.ends_with(".vbs")
+    {
+        return true;
+    }
+    // Ransomware / crypto / persistence / C2 keywords.
+    const KEYWORDS: &[&str] = &[
+        "http://",
+        "https://",
+        "ftp://",
+        ".onion",
+        "discord.com",
+        "telegram",
+        "webhook",
+        "electrora",
+        "keylog",
+        "screenshot",
+        "webcam",
+        "password",
+        "wallet",
+        "bitcoin",
+        "btc",
+        "ransom",
+        "encrypt",
+        "decrypt",
+        "cmd.exe",
+        "powershell",
+        "wscript",
+        "cscript",
+        "appdata",
+        "\\temp",
+        "/temp",
+        "hkey_",
+        "software\\",
+        "currentversion\\run",
+        "mozill",
+        "chrome",
+        "login data",
+        "user-agent",
+        "api/",
+        "createfile",
+        "writefile",
+        "virtualalloc",
+        "loadlibrary",
+        "getprocaddress",
+        "internetopen",
+        "httpsend",
+        "wsasocket",
+        "connect(",
+        "smb",
+        "ipc$",
+        "admin$",
+        "mssecsvc",
+        "tasksche",
+        "taskdl",
+        "taskse",
+        ".wnry",
+        ".wry",
+        "wanna",
+        "wcry",
+        "tor",
+        "onion",
+        "mutex",
+        "service",
+    ];
+    if KEYWORDS.iter().any(|k| lower.contains(k)) {
+        return true;
+    }
+    looks_like_ipv4(s) || looks_like_domain(s) || looks_like_killswitch_domain(s)
+}
+
+/// Long mostly-alpha domains (WannaCry kill-switch style).
+fn looks_like_killswitch_domain(s: &str) -> bool {
+    let lower = s.to_ascii_lowercase();
+    if lower.len() < 20 || lower.len() > 80 || lower.contains(' ') {
+        return false;
+    }
+    let host = lower.split('/').next().unwrap_or(&lower);
+    let Some((name, tld)) = host.rsplit_once('.') else {
+        return false;
+    };
+    matches!(tld, "com" | "net" | "org" | "info" | "biz" | "xyz" | "top")
+        && name.len() >= 16
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        && name.bytes().filter(|b| b.is_ascii_alphabetic()).count() * 100 / name.len() >= 80
 }
 
 fn looks_like_ipv4(s: &str) -> bool {
@@ -588,15 +802,32 @@ fn looks_like_domain(s: &str) -> bool {
         || lower.contains(".org")
         || lower.contains(".io")
         || lower.contains(".ru")
-        || lower.contains(".xyz"))
+        || lower.contains(".xyz")
+        || lower.contains(".onion")
+        || lower.contains(".info")
+        || lower.contains(".biz")
+        || lower.contains(".top"))
         && !lower.contains(' ')
         && lower.chars().filter(|c| *c == '.').count() >= 1
-        && s.len() < 80
+        && s.len() < 100
+        && !lower.contains("schemas.microsoft.com")
 }
 
 fn extract_ascii_strings(data: &[u8], min_len: usize) -> Vec<ExtractedString> {
     let mut out = Vec::new();
     let mut start = None;
+    let flush = |s: usize, end: usize, out: &mut Vec<ExtractedString>| {
+        if end - s >= min_len {
+            if let Ok(v) = std::str::from_utf8(&data[s..end]) {
+                out.push(ExtractedString {
+                    offset: s as u64,
+                    encoding: "ascii".into(),
+                    value: v.to_string(),
+                    xrefs: Vec::new(),
+                });
+            }
+        }
+    };
     for (i, &b) in data.iter().enumerate() {
         let printable = (0x20..=0x7e).contains(&b);
         if printable {
@@ -604,17 +835,12 @@ fn extract_ascii_strings(data: &[u8], min_len: usize) -> Vec<ExtractedString> {
                 start = Some(i);
             }
         } else if let Some(s) = start.take() {
-            if i - s >= min_len {
-                if let Ok(v) = std::str::from_utf8(&data[s..i]) {
-                    out.push(ExtractedString {
-                        offset: s as u64,
-                        encoding: "ascii".into(),
-                        value: v.to_string(),
-                        xrefs: Vec::new(),
-                    });
-                }
-            }
+            flush(s, i, &mut out);
         }
+    }
+    // Flush a run that reaches the end of the buffer.
+    if let Some(s) = start.take() {
+        flush(s, data.len(), &mut out);
     }
     out
 }
