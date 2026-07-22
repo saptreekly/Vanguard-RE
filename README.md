@@ -58,9 +58,11 @@ Threat scores come from IAT pattern matches and capability tags. Labels are buil
 Additional ranking rules:
 
 - **DOS COM** still gets a useful floor score; generic **Raw** blobs no longer auto-score 35
-- **Language packs** (`msg/m_*.wnry`, `.mui`, …), **source/build** (`.cpp`, `.tlog`, `.obj`, `.pdb`, …) are demoted so they cannot flood the ranking
-- **.NET** samples with high toolchain confidence get a managed score floor (higher when stealer-shaped strings are present) so AgentTesla-class binaries are not “benign” just because the native IAT is empty
-- **ELF / IoT bots** match a Unix socket-client pattern (`socket` + `connect` + `send`)
+- **Language packs** (`msg/m_*.wnry`, `.mui`, …), **source/build** (`.cpp`, `.tlog`, `.obj`, `.pdb`, …) are demoted so they cannot flood the ranking (skip with `--full`)
+- **PE children of a high-score dropper** (score ≥ 70) get a floor of 40 so thin-IAT helpers like WannaCry `taskdl.exe` outrank demoted noise
+- **.NET** samples with high toolchain confidence get a managed score floor (50+ at conf ≥ 90; higher with stealer/obfuscator/managed-net strings)
+- **ELF / IoT bots** match IAT socket patterns when linked, and static/stripped loaders (Mirai `dlr.*`) get a string floor from markers like `MIRAI` / `GET /bins/mirai`
+- Equal scores prefer PE/ELF/Mach-O/DOS over Raw so source trees cannot win a tie
 
 ## Build & install
 
@@ -77,7 +79,7 @@ Builtin signature rules are a lightweight string/byte matcher. External `.yar` f
 ## Usage
 
 ```bash
-vanguard <PATH> [--password infected] [--deep 3] [--disasm-count 4000] [--min-deep-score 70]
+vanguard <PATH> [--password infected] [--deep 3] [--disasm-count 4000] [--min-deep-score 70] [--full]
 ```
 
 | Flag | Default | Meaning |
@@ -86,6 +88,7 @@ vanguard <PATH> [--password infected] [--deep 3] [--disasm-count 4000] [--min-de
 | `--deep` | `3` | Number of top-scoring samples to deep-dive |
 | `--disasm-count` | `4000` | Max instructions to decode per deep-dive |
 | `--min-deep-score` | `70` | Minimum triage score required for a deep-dive |
+| `--full` | off | Keep language packs / source / raw noise in ranking (skip demotion) |
 
 Examples:
 
@@ -98,6 +101,9 @@ vanguard /path/to/malware.exe --password ""
 
 # Deeper disassembly budget on the top hit
 vanguard /path/to/sample.zip --deep 1 --disasm-count 8000
+
+# Noisy dump: do not demote language packs / source / raw blobs
+vanguard /path/to/sample.zip -p infected --full
 ```
 
 Stdout reports ranking, ImpHash clusters, PE/ELF triage, then deep-dive sections (YARA, network IOCs, crypto, secrets, imports, strings, disasm insights).

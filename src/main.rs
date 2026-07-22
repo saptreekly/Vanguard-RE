@@ -35,6 +35,10 @@ struct Args {
     /// Minimum triage score required for a deep-dive
     #[arg(long, default_value_t = 70)]
     min_deep_score: u8,
+
+    /// Keep language packs / source / raw noise in ranking (skip demotion)
+    #[arg(long, default_value_t = false)]
+    full: bool,
 }
 
 fn main() -> Result<()> {
@@ -57,6 +61,7 @@ fn main() -> Result<()> {
             disasm_count: args.disasm_count,
             yara_rules: None,
             min_deep_score: args.min_deep_score,
+            full: args.full,
         },
     )?;
 

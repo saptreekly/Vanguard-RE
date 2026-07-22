@@ -65,6 +65,8 @@ pub struct InvestigateOptions<'a> {
     pub disasm_count: usize,
     pub yara_rules: Option<&'a Path>,
     pub min_deep_score: u8,
+    /// When true, skip content-class demotion (language packs, source, raw noise).
+    pub full: bool,
 }
 
 impl Default for InvestigateOptions<'_> {
@@ -74,11 +76,16 @@ impl Default for InvestigateOptions<'_> {
             disasm_count: 512,
             yara_rules: None,
             min_deep_score: 70,
+            full: false,
         }
     }
 }
 
-pub fn triage_sample(sample: &QuarantinedSample, entropy_map: bool) -> Result<TriageReport> {
+pub fn triage_sample(
+    sample: &QuarantinedSample,
+    entropy_map: bool,
+    full: bool,
+) -> Result<TriageReport> {
     let binary = parse_binary_named(&sample.data, entropy_map, Some(sample.label.as_str()))?;
     let hashes = build_hash_bundle(&sample.data, &binary.imports);
     let mut threat = score_imports(&binary.imports);
@@ -98,7 +105,10 @@ pub fn triage_sample(sample: &QuarantinedSample, entropy_map: bool) -> Result<Tr
     }
 
     apply_managed_score_floor(&sample.data, &toolchain, &mut threat);
-    apply_content_class_demotion(&sample.label, binary.format, &mut threat);
+    apply_elf_bot_floor(&sample.data, &binary, &mut threat);
+    if !full {
+        apply_content_class_demotion(&sample.label, binary.format, &mut threat);
+    }
 
     Ok(TriageReport {
         path: sample.label.clone(),
@@ -147,20 +157,53 @@ fn apply_managed_score_floor(
     ];
     let stealer_hits = stealer_markers.iter().filter(|m| text.contains(*m)).count();
 
-    let floor = if stealer_hits >= 4 {
+    let obfuscator_hits = [
+        "confuser",
+        "smartassembly",
+        "babel",
+        "dotfuscator",
+        "reactor",
+        "obfuscar",
+    ]
+    .iter()
+    .filter(|m| text.contains(*m))
+    .count();
+
+    let managed_net_hits = [
+        "system.net",
+        "httpclient",
+        "webclient",
+        "downloadstring",
+        "downloadfile",
+        "assembly.load",
+        "frombase64string",
+    ]
+    .iter()
+    .filter(|m| text.contains(*m))
+    .count();
+
+    let mut floor = if stealer_hits >= 4 {
         75
     } else if stealer_hits >= 2 {
         60
     } else if stealer_hits >= 1 {
         50
+    } else if dotnet.confidence >= 90 {
+        50
     } else {
-        // Still outrank demoted noise so managed malware is not invisible.
         40
     };
 
+    if obfuscator_hits > 0 {
+        floor = floor.max(55);
+    }
+    if managed_net_hits >= 2 {
+        floor = floor.max(55);
+    }
+
     if threat.score < floor {
         threat.score = floor;
-        threat.label = format!(
+        let mut label = format!(
             "{} — .NET managed (conf {})",
             if floor >= 70 {
                 "high risk"
@@ -172,8 +215,67 @@ fn apply_managed_score_floor(
             dotnet.confidence
         );
         if stealer_hits > 0 {
-            threat.label.push_str(&format!(" / stealer-strings×{stealer_hits}"));
+            label.push_str(&format!(" / stealer-strings×{stealer_hits}"));
         }
+        if obfuscator_hits > 0 {
+            label.push_str(" / obfuscator");
+        }
+        if managed_net_hits >= 2 {
+            label.push_str(" / managed-net");
+        }
+        threat.label = label;
+    }
+}
+
+/// Static/stripped ELF bots (Mirai `dlr.*`) have no dynsym for IAT heuristics.
+/// Score from embedded strings and residual symbols instead.
+fn apply_elf_bot_floor(data: &[u8], binary: &crate::triage::ParsedBinary, threat: &mut ThreatScore) {
+    if binary.format != BinaryFormat::Elf || threat.score >= 65 {
+        return;
+    }
+
+    let window = &data[..data.len().min(2 * 1024 * 1024)];
+    let text = String::from_utf8_lossy(window).to_ascii_lowercase();
+
+    let strong = [
+        "mirai",
+        "dvrhelper",
+        "get /bins/mirai",
+        "busybox",
+        "/proc/self/exe",
+        "watchdog",
+    ];
+    let strong_hits = strong.iter().filter(|m| text.contains(*m)).count();
+
+    let network = ["socket", "connect", "send", "recv", "execve", "fork"];
+    let mut network_hits = network.iter().filter(|m| text.contains(*m)).count();
+    for sym in &binary.symbols {
+        let lower = sym.to_ascii_lowercase();
+        if network.iter().any(|n| lower == *n || lower.ends_with(&format!("_{n}"))) {
+            network_hits += 1;
+        }
+    }
+    // Deduplicate roughly — symbols + strings can double-count.
+    network_hits = network_hits.min(6);
+
+    let (floor, reason) = if strong_hits > 0 {
+        (70u8, "ELF bot/loader strings")
+    } else if network_hits >= 2 {
+        (60u8, "ELF network strings")
+    } else {
+        return;
+    };
+
+    if threat.score < floor {
+        threat.score = floor;
+        threat.label = format!(
+            "{} — {reason}",
+            if floor >= 70 {
+                "high risk"
+            } else {
+                "likely malicious tooling"
+            }
+        );
     }
 }
 
@@ -276,6 +378,45 @@ fn classify_content(path: &str, format: BinaryFormat) -> ContentClass {
     ContentClass::Interesting
 }
 
+/// Prefer real binaries over source/raw when scores tie (Mirai: `dlr.x86` before `admin.go`).
+fn format_rank(format: BinaryFormat) -> u8 {
+    match format {
+        BinaryFormat::Pe | BinaryFormat::Elf | BinaryFormat::MachO | BinaryFormat::DosCom => 0,
+        BinaryFormat::Raw | BinaryFormat::Unknown => 1,
+    }
+}
+
+/// Thin-IAT PE helpers (WannaCry `taskdl.exe`) score 0 while demoted noise
+/// still sits above them. Give PE children nested under a high-score PE
+/// dropper a modest floor so ranking stays dropper-first, helpers second,
+/// language packs last.
+fn apply_dropper_child_floor(triage: &mut [TriageReport]) {
+    const PARENT_MIN: u8 = 70;
+    const CHILD_FLOOR: u8 = 40;
+
+    let parents: Vec<String> = triage
+        .iter()
+        .filter(|r| r.binary.format == BinaryFormat::Pe && r.threat.score >= PARENT_MIN)
+        .map(|r| r.path.clone())
+        .collect();
+    if parents.is_empty() {
+        return;
+    }
+
+    for r in triage.iter_mut() {
+        if r.binary.format != BinaryFormat::Pe || r.threat.score >= CHILD_FLOOR {
+            continue;
+        }
+        let nested = parents
+            .iter()
+            .any(|parent| r.path.starts_with(&format!("{parent}::")));
+        if nested {
+            r.threat.score = CHILD_FLOOR;
+            r.threat.label = "suspicious — PE child of high-risk dropper".into();
+        }
+    }
+}
+
 /// Full automated investigation over in-memory quarantined samples.
 pub fn investigate(
     source: &str,
@@ -286,16 +427,19 @@ pub fn investigate(
     // work on every sample (including ZIP children).
     let mut triage = Vec::with_capacity(samples.len());
     for s in samples {
-        match triage_sample(s, false) {
+        match triage_sample(s, false, opts.full) {
             Ok(r) => triage.push(r),
             Err(e) => eprintln!("skip {}: {e:#}", s.label),
         }
     }
 
+    apply_dropper_child_floor(&mut triage);
+
     triage.sort_by(|a, b| {
         b.threat
             .score
             .cmp(&a.threat.score)
+            .then(format_rank(a.binary.format).cmp(&format_rank(b.binary.format)))
             .then(a.path.cmp(&b.path))
     });
 
@@ -490,6 +634,8 @@ pub fn short_name(path: &str) -> String {
 mod tests {
     use super::*;
     use crate::heuristics::ThreatScore;
+    use crate::signatures::HashBundle;
+    use crate::triage::{OperatingSystemEstimate, ParsedBinary};
 
     fn blank_threat(score: u8) -> ThreatScore {
         ThreatScore {
@@ -498,6 +644,47 @@ mod tests {
             behaviors: vec![],
             suspicious_apis: vec![],
             capabilities: vec![],
+        }
+    }
+
+    fn stub_triage(path: &str, format: BinaryFormat, score: u8) -> TriageReport {
+        TriageReport {
+            path: path.into(),
+            sha256: "0".repeat(64),
+            size: 0,
+            binary: ParsedBinary {
+                format,
+                architecture: "x86".into(),
+                operating_system: OperatingSystemEstimate {
+                    family: "Windows".into(),
+                    minimum_version: None,
+                    environment: None,
+                    evidence: "test".into(),
+                },
+                entry_point: 0,
+                is_64bit: false,
+                is_lib: false,
+                compile_timestamp: None,
+                has_signature: false,
+                image_file_offset: 0,
+                sections: vec![],
+                imports: vec![],
+                exports: vec![],
+                symbols: vec![],
+                section_entropies: vec![],
+                entropy_maps: vec![],
+            },
+            hashes: HashBundle {
+                md5: "0".repeat(32),
+                sha256: "0".repeat(64),
+                imphash: None,
+                ssdeep: None,
+                tlsh: None,
+            },
+            threat: blank_threat(score),
+            demangled_symbols: vec![],
+            packer_hints: vec![],
+            toolchain: vec![],
         }
     }
 
@@ -543,5 +730,100 @@ mod tests {
         apply_managed_score_floor(data, &toolchain, &mut threat);
         assert!(threat.score >= 60, "stealer .NET floor too low: {}", threat.score);
         assert!(threat.label.contains(".NET"));
+    }
+
+    #[test]
+    fn managed_floor_high_conf_without_stealer_is_fifty() {
+        let toolchain = vec![ToolchainFinding {
+            language: ".NET".into(),
+            confidence: 100,
+            evidence: vec!["BSJB".into()],
+        }];
+        let mut threat = blank_threat(0);
+        apply_managed_score_floor(b"plain managed assembly", &toolchain, &mut threat);
+        assert_eq!(threat.score, 50);
+    }
+
+    #[test]
+    fn managed_floor_obfuscator_or_net_strings() {
+        let toolchain = vec![ToolchainFinding {
+            language: ".NET".into(),
+            confidence: 80,
+            evidence: vec!["BSJB".into()],
+        }];
+        let mut threat = blank_threat(0);
+        apply_managed_score_floor(
+            b"ConfuserEx protected System.Net.HttpClient DownloadString",
+            &toolchain,
+            &mut threat,
+        );
+        assert!(threat.score >= 55, "obfuscator/net floor too low: {}", threat.score);
+    }
+
+    #[test]
+    fn elf_bot_floor_mirai_strings() {
+        let binary = stub_triage("dlr.x86", BinaryFormat::Elf, 0).binary;
+        let mut threat = blank_threat(0);
+        let data = b"MIRAI\0dvrHelper\0GET /bins/mirai.x86 HTTP/1.0\0";
+        apply_elf_bot_floor(data, &binary, &mut threat);
+        assert!(threat.score >= 70, "Mirai ELF floor too low: {}", threat.score);
+        assert!(threat.label.contains("ELF bot"));
+    }
+
+    #[test]
+    fn elf_without_needles_stays_low() {
+        let binary = stub_triage("clean.elf", BinaryFormat::Elf, 0).binary;
+        let mut threat = blank_threat(0);
+        apply_elf_bot_floor(b"GNU hello world program", &binary, &mut threat);
+        assert_eq!(threat.score, 0);
+    }
+
+    #[test]
+    fn ranking_tie_break_prefers_elf_over_source() {
+        assert!(format_rank(BinaryFormat::Elf) < format_rank(BinaryFormat::Raw));
+        let mut triage = vec![
+            stub_triage("admin.go", BinaryFormat::Raw, 0),
+            stub_triage("dlr.x86", BinaryFormat::Elf, 0),
+        ];
+        triage.sort_by(|a, b| {
+            b.threat
+                .score
+                .cmp(&a.threat.score)
+                .then(format_rank(a.binary.format).cmp(&format_rank(b.binary.format)))
+                .then(a.path.cmp(&b.path))
+        });
+        assert!(triage[0].path.contains("dlr.x86"), "ELF should rank before source at equal score");
+    }
+
+    #[test]
+    fn dropper_child_pe_gets_floor() {
+        let mut triage = vec![
+            stub_triage("dropper.exe", BinaryFormat::Pe, 96),
+            stub_triage(
+                "dropper.exe::embedded-1.zip::taskdl.exe",
+                BinaryFormat::Pe,
+                0,
+            ),
+            stub_triage(
+                "dropper.exe::embedded-1.zip::msg/m_english.wnry",
+                BinaryFormat::Raw,
+                5,
+            ),
+        ];
+        apply_dropper_child_floor(&mut triage);
+        assert_eq!(triage[1].threat.score, 40);
+        assert!(triage[1].threat.label.contains("PE child"));
+        // Language packs stay demoted — not PE, so no sibling boost.
+        assert_eq!(triage[2].threat.score, 5);
+    }
+
+    #[test]
+    fn unrelated_pe_is_not_boosted() {
+        let mut triage = vec![
+            stub_triage("dropper.exe", BinaryFormat::Pe, 96),
+            stub_triage("other.exe", BinaryFormat::Pe, 0),
+        ];
+        apply_dropper_child_floor(&mut triage);
+        assert_eq!(triage[1].threat.score, 0);
     }
 }

@@ -141,8 +141,72 @@ pub fn parse_binary_named(
             ))
         }
         Ok(Object::Unknown(_)) | Ok(_) | Err(_) => {
-            Ok(classify_and_parse_raw(data, with_entropy_map, name_hint))
+            if let Some(parsed) = try_parse_elf_salvage(data, with_entropy_map) {
+                Ok(parsed)
+            } else {
+                Ok(classify_and_parse_raw(data, with_entropy_map, name_hint))
+            }
         }
+    }
+}
+
+fn looks_like_elf_magic(data: &[u8]) -> bool {
+    data.len() >= 4 && data[..4] == [0x7f, b'E', b'L', b'F']
+}
+
+/// When strict goblin fails on a recognizable ELF (bad section table, etc.),
+/// retry permissive parse, then fall back to a header-only ELF stub.
+fn try_parse_elf_salvage(data: &[u8], with_entropy_map: bool) -> Option<ParsedBinary> {
+    if !looks_like_elf_magic(data) {
+        return None;
+    }
+    let opts = goblin::options::ParseOptions::permissive();
+    if let Ok(elf) = goblin::elf::Elf::parse_with_opts(data, &opts) {
+        return parse_elf(data, elf, with_entropy_map).ok();
+    }
+    let header = goblin::elf::Elf::parse_header(data).ok()?;
+    Some(parse_elf_header_only(data, &header, with_entropy_map))
+}
+
+fn elf_machine_arch(e_machine: u16) -> &'static str {
+    match e_machine {
+        goblin::elf::header::EM_X86_64 => "x86_64",
+        goblin::elf::header::EM_386 => "x86",
+        goblin::elf::header::EM_AARCH64 => "aarch64",
+        goblin::elf::header::EM_ARM => "arm",
+        goblin::elf::header::EM_MIPS => "mips",
+        _ => "unknown",
+    }
+}
+
+fn parse_elf_header_only(
+    _data: &[u8],
+    header: &goblin::elf::Header,
+    _with_map: bool,
+) -> ParsedBinary {
+    let arch = elf_machine_arch(header.e_machine);
+    let is_64 = header.e_ident[goblin::elf::header::EI_CLASS] == goblin::elf::header::ELFCLASS64;
+    ParsedBinary {
+        format: BinaryFormat::Elf,
+        architecture: arch.into(),
+        operating_system: OperatingSystemEstimate {
+            family: "Unix / System V".into(),
+            minimum_version: None,
+            environment: None,
+            evidence: "ELF magic (header-only salvage; section table unreadable)".into(),
+        },
+        entry_point: header.e_entry,
+        is_64bit: is_64,
+        is_lib: header.e_type == goblin::elf::header::ET_DYN,
+        compile_timestamp: None,
+        has_signature: false,
+        image_file_offset: 0,
+        sections: Vec::new(),
+        imports: Vec::new(),
+        exports: Vec::new(),
+        symbols: Vec::new(),
+        section_entropies: Vec::new(),
+        entropy_maps: Vec::new(),
     }
 }
 
@@ -446,14 +510,7 @@ fn parse_elf(data: &[u8], elf: goblin::elf::Elf<'_>, with_map: bool) -> Result<P
         .take(500)
         .collect();
 
-    let arch = match elf.header.e_machine {
-        goblin::elf::header::EM_X86_64 => "x86_64",
-        goblin::elf::header::EM_386 => "x86",
-        goblin::elf::header::EM_AARCH64 => "aarch64",
-        goblin::elf::header::EM_ARM => "arm",
-        goblin::elf::header::EM_MIPS => "mips",
-        _ => "unknown",
-    };
+    let arch = elf_machine_arch(elf.header.e_machine);
     let operating_system =
         elf_os_estimate(elf.header.e_ident[goblin::elf::header::EI_OSABI], &imports);
 
@@ -764,6 +821,33 @@ mod tests {
         // public parse path on a tiny invalid buffer (no crash / empty imports).
         let parsed = parse_binary_named(b"\x7fELFnot-real", false, Some("bad.elf")).unwrap();
         assert!(parsed.imports.is_empty() || parsed.format != BinaryFormat::Elf);
+    }
+
+    #[test]
+    fn elf_magic_with_broken_sections_still_salvages_as_elf() {
+        // Minimal ELF32 header (little-endian, EM_386) with e_shoff past EOF so
+        // strict parse fails; permissive/header salvage must keep BinaryFormat::Elf.
+        let mut elf = vec![0u8; 52];
+        elf[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+        elf[4] = 1; // ELFCLASS32
+        elf[5] = 1; // ELFDATA2LSB
+        elf[6] = 1; // EV_CURRENT
+        elf[16] = 2; // ET_EXEC
+        elf[18] = 3; // EM_386
+        elf[20] = 1; // EV_CURRENT
+        // e_entry at 24
+        elf[24..28].copy_from_slice(&0x8048000u32.to_le_bytes());
+        elf[28..32].copy_from_slice(&52u32.to_le_bytes()); // e_phoff
+        elf[32..36].copy_from_slice(&0x0fff_ffffu32.to_le_bytes()); // e_shoff past EOF
+        elf[44..46].copy_from_slice(&52u16.to_le_bytes()); // e_ehsize
+        elf[46..48].copy_from_slice(&32u16.to_le_bytes()); // e_phentsize
+        elf[48..50].copy_from_slice(&0u16.to_le_bytes()); // e_phnum
+        elf[50..52].copy_from_slice(&40u16.to_le_bytes()); // e_shentsize
+        // e_shnum / e_shstrndx default 0 in remaining zeros — still bad shoff.
+
+        let parsed = parse_binary_named(&elf, false, Some("broken.elf")).unwrap();
+        assert_eq!(parsed.format, BinaryFormat::Elf, "\\x7fELF must not fall to Raw");
+        assert_eq!(parsed.architecture, "x86");
     }
 
     #[test]

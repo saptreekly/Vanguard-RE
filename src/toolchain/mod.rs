@@ -51,6 +51,8 @@ const MARKERS: &[Marker] = &[
     Marker { language: ".NET", needle: b"mscorlib", weight: 45, evidence: "mscorlib reference" },
     Marker { language: ".NET", needle: b"<Module>", weight: 30, evidence: "<Module> metadata token" },
     Marker { language: ".NET", needle: b"System.Private.CoreLib", weight: 45, evidence: "CoreLib reference" },
+    Marker { language: ".NET", needle: b"_CorExeMain", weight: 85, evidence: "_CorExeMain CLR entry" },
+    Marker { language: ".NET", needle: b"_CorDllMain", weight: 80, evidence: "_CorDllMain CLR entry" },
 
     // ── MSVC C/C++ ─────────────────────────────────────────────────────────
     Marker { language: "MSVC C/C++", needle: b"Microsoft Visual C++ Runtime", weight: 55, evidence: "MSVC runtime string" },
@@ -149,13 +151,19 @@ pub fn identify(data: &[u8], binary: &ParsedBinary) -> Vec<ToolchainFinding> {
         }
     }
 
-    // 2) Import DLLs.
+    // 2) Import DLLs + CLR entrypoints.
     for imp in &binary.imports {
         let lib = imp.library.to_ascii_lowercase();
         for rule in IMPORT_RULES {
             if lib.contains(rule.dll_needle) {
                 bump(rule.language, rule.weight, rule.evidence.to_string());
             }
+        }
+        let func = imp.function.to_ascii_lowercase();
+        if func.contains("_corexemain") {
+            bump(".NET", 85, "imports _CorExeMain".into());
+        } else if func.contains("_cordllmain") {
+            bump(".NET", 80, "imports _CorDllMain".into());
         }
     }
 
