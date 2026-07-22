@@ -15,7 +15,7 @@
 
 use std::fs::File;
 use std::io::{Cursor, Read, Seek};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use walkdir::WalkDir;
@@ -25,8 +25,15 @@ use crate::util::map_file;
 
 const MAX_ARCHIVE_DEPTH: usize = 3;
 const MAX_ARCHIVE_MEMBERS: usize = 512;
+/// Hard cap on central-directory entries inspected (priority scan + listing).
+/// Malware can advertise millions of CD entries; never materialize that many.
+const MAX_CENTRAL_DIR_SCAN: usize = 4_096;
 const MAX_MEMBER_SIZE: u64 = 128 * 1024 * 1024;
 const MAX_TOTAL_EXTRACTED: u64 = 512 * 1024 * 1024;
+/// Cap carved embedded ZIPs per sample to bound carve/parse work.
+const MAX_EMBEDDED_ZIPS: usize = 32;
+/// Cap total quarantined samples retained for one investigation.
+const MAX_QUARANTINED_SAMPLES: usize = 2_048;
 
 /// A sample ready for static analysis. Bytes live in process memory only.
 #[derive(Debug, Clone)]
@@ -111,6 +118,7 @@ pub fn containment_policy() -> ContainmentReport {
             "No process spawn / CreateProcess / execve of sample bytes.".into(),
             "ZIP members are never extracted with execute permission.".into(),
             "Recovered inner-archive payloads stay in RAM; never written as runnable files.".into(),
+            "Archive depth, member count, per-member/total bytes, sample count, and host file size are capped.".into(),
             "Dynamic analysis would require an external microVM — not host exec.".into(),
         ],
     }
@@ -158,21 +166,36 @@ pub fn collect_samples(
         bail!("{} is not a file or directory", path.display());
     }
 
+    // Never follow directory symlinks into unrelated trees (malicious corpora).
     let walker = if recursive {
-        WalkDir::new(path)
+        WalkDir::new(path).follow_links(false)
     } else {
-        WalkDir::new(path).max_depth(1)
+        WalkDir::new(path).max_depth(1).follow_links(false)
     };
 
     let mut out = Vec::new();
     for entry in walker.into_iter().filter_map(|e| e.ok()) {
-        if !entry.file_type().is_file() {
+        if out.len() >= MAX_QUARANTINED_SAMPLES {
+            eprintln!(
+                "sample cap ({MAX_QUARANTINED_SAMPLES}) reached under {}; stopping directory walk",
+                path.display()
+            );
+            break;
+        }
+        // Skip symlinks entirely — only analyze regular files.
+        if entry.path_is_symlink() || !entry.file_type().is_file() {
             continue;
         }
         let p = entry.path();
         if is_zip(p) {
             match decrypt_zip_in_memory(p, password) {
-                Ok(mut samples) => out.append(&mut samples),
+                Ok(mut samples) => {
+                    let room = MAX_QUARANTINED_SAMPLES.saturating_sub(out.len());
+                    if samples.len() > room {
+                        samples.truncate(room);
+                    }
+                    out.append(&mut samples);
+                }
                 Err(e) => eprintln!("skip zip {}: {e:#}", p.display()),
             }
         } else {
@@ -211,7 +234,7 @@ fn embedded_zip_ranges(data: &[u8]) -> Vec<std::ops::Range<usize>> {
     let mut ranges = Vec::new();
     let mut search_from = 0;
 
-    while search_from + LOCAL.len() <= data.len() {
+    while search_from + LOCAL.len() <= data.len() && ranges.len() < MAX_EMBEDDED_ZIPS {
         let Some(rel_start) = data[search_from..]
             .windows(LOCAL.len())
             .position(|w| w == LOCAL)
@@ -267,6 +290,17 @@ fn expand_embedded_archives(
         roots.into_iter().map(|sample| (sample, 0)).collect();
 
     while let Some((mut sample, depth)) = pending.pop() {
+        if out.len() + pending.len() >= MAX_QUARANTINED_SAMPLES {
+            // Keep what we have; drop further expansion to bound memory.
+            out.push(sample);
+            while let Some((extra, _)) = pending.pop() {
+                if out.len() >= MAX_QUARANTINED_SAMPLES {
+                    break;
+                }
+                out.push(extra);
+            }
+            break;
+        }
         if depth < MAX_ARCHIVE_DEPTH {
             for (index, range) in embedded_zip_ranges(&sample.data).into_iter().enumerate() {
                 // A sample that is itself exactly a ZIP was already expanded by
@@ -293,6 +327,9 @@ fn expand_embedded_archives(
                         Ok(children) => {
                             let n = children.len();
                             for child in children {
+                                if out.len() + pending.len() + 1 >= MAX_QUARANTINED_SAMPLES {
+                                    break;
+                                }
                                 pending.push((child, depth + 1));
                             }
                             n
@@ -312,6 +349,9 @@ fn expand_embedded_archives(
                         {
                             extracted = children.len();
                             for child in children {
+                                if out.len() + pending.len() + 1 >= MAX_QUARANTINED_SAMPLES {
+                                    break;
+                                }
                                 pending.push((child, depth + 1));
                             }
                         }
@@ -341,7 +381,7 @@ fn expand_embedded_archives(
 /// even for password-protected archives (e.g. WannaCry's `WNcry@2ol7` bundle).
 fn list_zip_members<R: Read + Seek>(reader: R) -> Result<Vec<EmbeddedMember>> {
     let mut archive = ZipArchive::new(reader)?;
-    let count = archive.len().min(MAX_ARCHIVE_MEMBERS);
+    let count = archive.len().min(MAX_ARCHIVE_MEMBERS).min(MAX_CENTRAL_DIR_SCAN);
     let mut members = Vec::with_capacity(count);
     for i in 0..count {
         let meta = archive.by_index_raw(i)?;
@@ -442,26 +482,32 @@ fn password_candidate_rank(s: &str) -> (u8, u8, usize) {
 fn try_recover_zip_password(blob: &[u8], candidates: &[String]) -> Option<String> {
     let mut archive = ZipArchive::new(Cursor::new(blob)).ok()?;
 
-    // Pick the cheapest encrypted member to probe.
+    // Pick the cheapest encrypted member to probe — bound by declared size so
+    // a tiny compressed stream with a huge declared uncompressed size cannot
+    // become a decompression bomb during password trials.
+    let scan = archive.len().min(MAX_CENTRAL_DIR_SCAN);
     let mut target = None;
     let mut best = u64::MAX;
-    for i in 0..archive.len() {
+    for i in 0..scan {
         if let Ok(m) = archive.by_index_raw(i) {
-            if m.encrypted() && !m.is_dir() && m.compressed_size() < best {
+            if m.encrypted()
+                && !m.is_dir()
+                && m.size() > 0
+                && m.size() <= MAX_MEMBER_SIZE
+                && m.compressed_size() < best
+            {
                 best = m.compressed_size();
-                target = Some(i);
+                target = Some((i, m.size()));
             }
         }
     }
-    let idx = target?;
+    let (idx, declared) = target?;
 
-    let mut scratch = Vec::new();
     for cand in candidates {
         match archive.by_index_decrypt(idx, cand.as_bytes()) {
-            Ok(mut entry) => {
-                scratch.clear();
-                // A clean read implies the CRC validated → correct password.
-                if entry.read_to_end(&mut scratch).is_ok() {
+            Ok(entry) => {
+                // A clean bounded read implies the CRC validated → correct password.
+                if read_zip_member_bounded(entry, declared, declared).is_ok() {
                     return Some(cand.clone());
                 }
             }
@@ -471,6 +517,34 @@ fn try_recover_zip_password(blob: &[u8], candidates: &[String]) -> Option<String
     None
 }
 
+/// Read at most `limit` decompressed bytes from a ZIP member.
+///
+/// Declared uncompressed sizes are attacker-controlled. Trusting them for
+/// `read_to_end` alone enables classic zip bombs (small compressed payload,
+/// huge expansion). We always hard-cap the read and reject oversize streams.
+fn read_zip_member_bounded<R: Read>(entry: R, declared: u64, budget: u64) -> Result<Vec<u8>> {
+    let limit = declared.min(MAX_MEMBER_SIZE).min(budget);
+    if limit == 0 {
+        // Empty members are fine; anything that still yields bytes is hostile.
+        let mut probe = entry.take(1);
+        let mut bump = [0u8; 1];
+        let n = probe.read(&mut bump)?;
+        if n != 0 {
+            bail!("ZIP member produced data despite declared size 0");
+        }
+        return Ok(Vec::new());
+    }
+
+    let mut reader = entry.take(limit.saturating_add(1));
+    // Avoid eagerly committing the full declared size (often a lie).
+    let mut data = Vec::with_capacity((limit as usize).min(64 * 1024));
+    reader.read_to_end(&mut data)?;
+    if data.len() as u64 > limit {
+        bail!("ZIP member expanded past bound ({limit} bytes; declared {declared})");
+    }
+    Ok(data)
+}
+
 fn extract_zip_members<R: Read + Seek>(
     reader: R,
     archive_label: &str,
@@ -478,7 +552,15 @@ fn extract_zip_members<R: Read + Seek>(
 ) -> Result<Vec<QuarantinedSample>> {
     let mut archive =
         ZipArchive::new(reader).with_context(|| format!("parse ZIP {archive_label}"))?;
-    let mut indices: Vec<(usize, u8)> = (0..archive.len())
+    let scan_len = archive.len().min(MAX_CENTRAL_DIR_SCAN);
+    if archive.len() > MAX_CENTRAL_DIR_SCAN {
+        eprintln!(
+            "{archive_label} advertises {} central-directory entries; scanning only \
+             {MAX_CENTRAL_DIR_SCAN}",
+            archive.len()
+        );
+    }
+    let mut indices: Vec<(usize, u8)> = (0..scan_len)
         .map(|i| {
             let priority = archive
                 .by_index_raw(i)
@@ -523,14 +605,22 @@ fn extract_zip_members<R: Read + Seek>(
         if is_dir {
             continue;
         }
-        if name.contains("..") || Path::new(&name).is_absolute() {
-            eprintln!("skip unsafe ZIP path in {archive_label}: {name}");
+        if is_unsafe_zip_path(&name) {
+            eprintln!(
+                "skip unsafe ZIP path in {archive_label}: {}",
+                sanitize_member_name(&name)
+            );
             continue;
         }
         if size > MAX_MEMBER_SIZE || total_extracted.saturating_add(size) > MAX_TOTAL_EXTRACTED {
-            eprintln!("skip oversized ZIP member in {archive_label}: {name} ({size} bytes)");
+            eprintln!(
+                "skip oversized ZIP member in {archive_label}: {} ({size} bytes)",
+                sanitize_member_name(&name)
+            );
             continue;
         }
+
+        let budget = MAX_TOTAL_EXTRACTED.saturating_sub(total_extracted);
 
         if encrypted {
             encrypted_seen = true;
@@ -540,7 +630,7 @@ fn extract_zip_members<R: Read + Seek>(
                 );
             };
 
-            let mut entry = match archive.by_index_decrypt(i, pw.as_bytes()) {
+            let entry = match archive.by_index_decrypt(i, pw.as_bytes()) {
                 Ok(e) => e,
                 Err(zip::result::ZipError::InvalidPassword) => {
                     password_failures += 1;
@@ -558,14 +648,16 @@ fn extract_zip_members<R: Read + Seek>(
             };
 
             let member = sanitize_member_name(entry.name());
-            let mut data = Vec::with_capacity(size as usize);
-            if let Err(e) = entry.read_to_end(&mut data) {
-                password_failures += 1;
-                eprintln!(
-                    "skip {archive_label} [{member}]: decrypt/read failed ({e}) — wrong password?"
-                );
-                continue;
-            }
+            let data = match read_zip_member_bounded(entry, size, budget) {
+                Ok(data) => data,
+                Err(e) => {
+                    password_failures += 1;
+                    eprintln!(
+                        "skip {archive_label} [{member}]: decrypt/read failed ({e}) — wrong password or bomb?"
+                    );
+                    continue;
+                }
+            };
             total_extracted = total_extracted.saturating_add(data.len() as u64);
 
             samples.push(QuarantinedSample::new(
@@ -574,13 +666,11 @@ fn extract_zip_members<R: Read + Seek>(
                 data,
             ));
         } else {
-            let mut entry = archive
+            let entry = archive
                 .by_index(i)
                 .with_context(|| format!("ZIP index {i}"))?;
             let member = sanitize_member_name(entry.name());
-            let mut data = Vec::with_capacity(size as usize);
-            entry
-                .read_to_end(&mut data)
+            let data = read_zip_member_bounded(entry, size, budget)
                 .with_context(|| format!("read ZIP member {member}"))?;
             total_extracted = total_extracted.saturating_add(data.len() as u64);
             samples.push(QuarantinedSample::new(
@@ -627,12 +717,45 @@ fn archive_member_priority(name: &str) -> u8 {
     }
 }
 
+/// Reject ZIP member names that look like traversal / absolute / drive paths.
+///
+/// Members are never written to disk, but unsafe names still poison labels and
+/// can confuse downstream tooling that re-parses report paths.
+fn is_unsafe_zip_path(name: &str) -> bool {
+    if name.is_empty() || name.contains('\0') {
+        return true;
+    }
+    // Windows drive / UNC style must be rejected even when the host is Unix.
+    let bytes = name.as_bytes();
+    if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+        return true;
+    }
+    if name.starts_with('\\') || name.starts_with("//") || name.starts_with("\\\\") {
+        return true;
+    }
+
+    let path = Path::new(name);
+    if path.is_absolute() {
+        return true;
+    }
+    for component in path.components() {
+        match component {
+            Component::ParentDir | Component::Prefix(_) | Component::RootDir => return true,
+            Component::Normal(part) if part == ".." => return true,
+            _ => {}
+        }
+    }
+    // Path::components on Unix treats `\` as a normal character; still split.
+    name.split(['/', '\\']).any(|part| part == "..")
+}
+
 fn sanitize_member_name(name: &str) -> String {
     // Flatten to a single path component for labels; reject traversal earlier.
-    PathBuf::from(name)
+    let cleaned = name.replace('\0', "");
+    PathBuf::from(&cleaned)
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| name.replace(['/', '\\'], "_"))
+        .unwrap_or_else(|| cleaned.replace(['/', '\\'], "_"))
 }
 
 #[cfg(test)]
@@ -803,5 +926,73 @@ mod tests {
         let ranked = password_candidate_rank("WNcry@2ol7");
         let weak = password_candidate_rank("aaaaaaaa");
         assert!(ranked < weak);
+    }
+
+    #[test]
+    fn bounded_read_rejects_oversize_stream() {
+        // Simulated member: claims 4 bytes but keeps yielding data.
+        let evil = std::io::repeat(b'A');
+        let err = read_zip_member_bounded(evil, 4, 4).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("expanded past bound") || msg.contains("past bound"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn bounded_read_accepts_exact_stream() {
+        let data = b"abcd";
+        let got = read_zip_member_bounded(Cursor::new(data.as_slice()), 4, 4).unwrap();
+        assert_eq!(got, data);
+    }
+
+    #[test]
+    fn bounded_read_rejects_nonzero_when_declared_zero() {
+        let err = read_zip_member_bounded(Cursor::new(b"x"), 0, 0).unwrap_err();
+        assert!(format!("{err:#}").contains("declared size 0"));
+    }
+
+    #[test]
+    fn unsafe_zip_paths_are_rejected() {
+        assert!(is_unsafe_zip_path(""));
+        assert!(is_unsafe_zip_path("/etc/passwd"));
+        assert!(is_unsafe_zip_path("../evil.exe"));
+        assert!(is_unsafe_zip_path("foo/../../evil.exe"));
+        assert!(is_unsafe_zip_path("foo\\..\\evil.exe"));
+        assert!(is_unsafe_zip_path("C:\\Windows\\evil.exe"));
+        assert!(is_unsafe_zip_path("\\\\server\\share\\evil.exe"));
+        assert!(is_unsafe_zip_path("evil\0.exe"));
+        // Legitimate nested members must still be allowed.
+        assert!(!is_unsafe_zip_path("msg/m_english.wnry"));
+        assert!(!is_unsafe_zip_path("taskse.exe"));
+        // ".." inside a filename is not traversal.
+        assert!(!is_unsafe_zip_path("foo..bar.exe"));
+    }
+
+    #[test]
+    fn extract_skips_traversal_member_names() {
+        let zip = test_zip("../evil.exe", b"MZ");
+        let samples = extract_zip_members(Cursor::new(zip), "t.zip", None);
+        // Sole member rejected → empty archive error.
+        assert!(samples.is_err());
+    }
+
+    #[test]
+    fn map_file_rejects_oversize_sample() {
+        use std::io::{Seek, SeekFrom, Write};
+        let dir = std::env::temp_dir().join(format!("vanguard-oversized-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("huge.bin");
+        {
+            let mut f = File::create(&path).unwrap();
+            // Sparse-ish grow: seek past the limit and write one byte.
+            f.seek(SeekFrom::Start(crate::util::MAX_SAMPLE_BYTES)).unwrap();
+            f.write_all(&[1]).unwrap();
+        }
+        let err = map_file(&path).unwrap_err();
+        assert!(format!("{err:#}").contains("exceeds max sample size"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

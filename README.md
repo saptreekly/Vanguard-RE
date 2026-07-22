@@ -130,7 +130,9 @@ Passworded malware packs and ZIPs embedded inside binaries are decrypted into RA
 - **Static-only** — nothing is executed on the host
 - Top-level and embedded ZIP members stay in process memory; never written as runnable files
 - Recovered inner payloads (e.g. decrypted WannaCry `.wnry` files) are analyzed in RAM only, never dropped to disk as runnable files
-- Recursive archive depth, member count, per-member size, and total extraction are bounded
+- Archive depth, member count, per-member/total bytes, central-directory scans, embedded-ZIP carves, and total sample count are capped; host files over 512 MiB are refused
+- ZIP member reads are hard-bounded on actual decompression (not just declared sizes) to blunt zip bombs
+- Path traversal / absolute / drive-style ZIP names are rejected; corpus walks do not follow symlinks
 - Dynamic analysis (if added later) would use a real microVM, not host exec
 
 ## License
