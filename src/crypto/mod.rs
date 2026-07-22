@@ -5,10 +5,16 @@
 //! stream-cipher sigma strings, and PEM headers. We also flag CryptoAPI/CNG
 //! imports. Nothing is executed; this only tells an analyst *what* a sample is
 //! likely built to encrypt/hash with (e.g. ransomware key/stream ciphers).
+//!
+//! Weak XOR recovery (repeating key + keystream reuse) lives in [`xor`].
+
+pub mod xor;
 
 use std::collections::BTreeMap;
 
 use crate::triage::ImportEntry;
+
+pub use xor::{XorMethod, XorRecovery, scan as scan_xor, scan_pairwise_across};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CryptoCategory {

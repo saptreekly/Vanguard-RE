@@ -7,16 +7,42 @@ use super::report::SectionInfo;
 use anyhow::{Context, Result, bail};
 use goblin::Object;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BinaryFormat {
     Pe,
     Elf,
     MachO,
     /// MS-DOS COM (no MZ header) — common for classic viruses
     DosCom,
+    /// ZIP / ZIP-like container (PK\x03\x04)
+    Zip,
+    /// Rich Text Format document
+    Rtf,
+    /// Raster image (BMP / PNG / JPEG)
+    Image,
+    /// Mostly-printable ASCII / UTF-16LE text or config
+    Text,
+    /// Known encrypted/payload magic (e.g. WannaCry `WANACRY!`)
+    Encrypted,
     /// Unrecognized blob — hashes / strings / YARA only
     Raw,
     Unknown,
+}
+
+impl BinaryFormat {
+    pub fn is_executable(self) -> bool {
+        matches!(
+            self,
+            Self::Pe | Self::Elf | Self::MachO | Self::DosCom
+        )
+    }
+
+    pub fn is_content(self) -> bool {
+        matches!(
+            self,
+            Self::Zip | Self::Rtf | Self::Image | Self::Text | Self::Encrypted
+        )
+    }
 }
 
 impl std::fmt::Display for BinaryFormat {
@@ -26,6 +52,11 @@ impl std::fmt::Display for BinaryFormat {
             Self::Elf => write!(f, "ELF"),
             Self::MachO => write!(f, "Mach-O"),
             Self::DosCom => write!(f, "DOS-COM"),
+            Self::Zip => write!(f, "ZIP"),
+            Self::Rtf => write!(f, "RTF"),
+            Self::Image => write!(f, "Image"),
+            Self::Text => write!(f, "Text"),
+            Self::Encrypted => write!(f, "Encrypted"),
             Self::Raw => write!(f, "RAW"),
             Self::Unknown => write!(f, "Unknown"),
         }
@@ -227,6 +258,11 @@ fn classify_raw(data: &[u8], name_hint: Option<&str>) -> (BinaryFormat, &'static
         return (BinaryFormat::Raw, "dos-mz");
     }
 
+    // Content magics before the loose DOS COM prologue heuristic.
+    if let Some(hit) = classify_content_magic(data) {
+        return hit;
+    }
+
     let looks_com_name = name_hint.is_some_and(|n| {
         Path::new(n)
             .extension()
@@ -235,12 +271,98 @@ fn classify_raw(data: &[u8], name_hint: Option<&str>) -> (BinaryFormat, &'static
     });
 
     // Classic DOS COM: no MZ, ≤ 64KiB, executable-looking start (or .com name).
-    if !data.is_empty() && data.len() <= 65535 && (looks_com_name || looks_like_com_prologue(data))
+    // Skip when the blob is mostly printable text (ransom notes start with 'Q'
+    // which overlaps the push-r16 opcode band).
+    if !data.is_empty()
+        && data.len() <= 65535
+        && (looks_com_name || looks_like_com_prologue(data))
+        && !looks_mostly_text(data)
     {
         return (BinaryFormat::DosCom, "x86-16");
     }
 
+    if looks_mostly_text(data) {
+        return (BinaryFormat::Text, "text");
+    }
+
     (BinaryFormat::Raw, "unknown")
+}
+
+fn classify_content_magic(data: &[u8]) -> Option<(BinaryFormat, &'static str)> {
+    if data.starts_with(b"{\\rtf") {
+        return Some((BinaryFormat::Rtf, "rtf"));
+    }
+    if data.starts_with(b"PK\x03\x04") || data.starts_with(b"PK\x05\x06") || data.starts_with(b"PK\x07\x08")
+    {
+        return Some((BinaryFormat::Zip, "zip"));
+    }
+    if data.starts_with(b"BM") && data.len() >= 14 {
+        return Some((BinaryFormat::Image, "bmp"));
+    }
+    if data.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Some((BinaryFormat::Image, "png"));
+    }
+    if data.len() >= 3 && data[0] == 0xff && data[1] == 0xd8 && data[2] == 0xff {
+        return Some((BinaryFormat::Image, "jpeg"));
+    }
+    if data.starts_with(b"%PDF") {
+        return Some((BinaryFormat::Raw, "pdf"));
+    }
+    // WannaCry encrypted-file / payload header.
+    if data.starts_with(b"WANACRY!") {
+        return Some((BinaryFormat::Encrypted, "wanacry"));
+    }
+    None
+}
+
+fn looks_mostly_text(data: &[u8]) -> bool {
+    if data.is_empty() {
+        return false;
+    }
+    if looks_utf16le_text(data) {
+        return true;
+    }
+    // Config blobs with a binary header + ASCII body (WannaCry c.wnry).
+    if data.windows(6).any(|w| w.eq_ignore_ascii_case(b".onion"))
+        || data.windows(7).any(|w| w.eq_ignore_ascii_case(b"http://"))
+        || data.windows(8).any(|w| w.eq_ignore_ascii_case(b"https://"))
+    {
+        return true;
+    }
+    // Skip leading NUL padding.
+    let start = data.iter().position(|&b| b != 0).unwrap_or(0);
+    let slice = &data[start..];
+    if slice.is_empty() {
+        return false;
+    }
+    let n = slice.len().min(512);
+    let printable = slice[..n]
+        .iter()
+        .filter(|&&b| (0x20..=0x7e).contains(&b) || matches!(b, b'\n' | b'\r' | b'\t' | b';'))
+        .count();
+    printable * 100 / n >= 85
+}
+
+fn looks_utf16le_text(data: &[u8]) -> bool {
+    if data.len() < 8 {
+        return false;
+    }
+    if data.starts_with(&[0xff, 0xfe]) {
+        return true;
+    }
+    let pairs = data.len().min(128) / 2;
+    if pairs == 0 {
+        return false;
+    }
+    let mut asciiish = 0;
+    for i in 0..pairs {
+        let lo = data[i * 2];
+        let hi = data[i * 2 + 1];
+        if hi == 0 && ((0x20..=0x7e).contains(&lo) || matches!(lo, b'\n' | b'\r' | b'\t')) {
+            asciiish += 1;
+        }
+    }
+    asciiish * 100 / pairs >= 70
 }
 
 /// Common 16-bit real-mode / COM entry opcodes (JMP/CALL/INT/MOV/PUSH/…).
@@ -271,17 +393,24 @@ fn parse_raw_blob(data: &[u8], with_map: bool, format: BinaryFormat, arch: &str)
         format,
         architecture: arch.into(),
         operating_system: OperatingSystemEstimate {
-            family: if format == BinaryFormat::DosCom {
-                "DOS".into()
-            } else {
-                "Unknown".into()
+            family: match format {
+                BinaryFormat::DosCom => "DOS".into(),
+                BinaryFormat::Rtf | BinaryFormat::Text => "Document".into(),
+                BinaryFormat::Image => "Image".into(),
+                BinaryFormat::Zip => "Archive".into(),
+                BinaryFormat::Encrypted => "Encrypted".into(),
+                _ => "Unknown".into(),
             },
             minimum_version: None,
             environment: None,
-            evidence: if format == BinaryFormat::DosCom {
-                "DOS COM format".into()
-            } else {
-                "no recognized executable header".into()
+            evidence: match format {
+                BinaryFormat::DosCom => "DOS COM format".into(),
+                BinaryFormat::Rtf => "RTF document magic".into(),
+                BinaryFormat::Zip => "ZIP local/central header magic".into(),
+                BinaryFormat::Image => format!("image magic ({arch})"),
+                BinaryFormat::Text => "mostly-printable text/config".into(),
+                BinaryFormat::Encrypted => format!("encrypted payload magic ({arch})"),
+                _ => "no recognized executable header".into(),
             },
         },
         entry_point: 0,
@@ -858,5 +987,33 @@ mod tests {
         assert_eq!(parsed.format, BinaryFormat::Raw);
         assert_eq!(parsed.architecture, "jvm-bytecode");
         assert_eq!(detect_format(&class), BinaryFormat::Raw);
+    }
+
+    #[test]
+    fn detects_rtf_bmp_zip_text_and_wanacry() {
+        let rtf = parse_binary_named(br"{\rtf1\ansi hello}", false, Some("m_english.wnry")).unwrap();
+        assert_eq!(rtf.format, BinaryFormat::Rtf);
+
+        let mut bmp = vec![b'B', b'M', 0, 0, 0, 0, 0, 0, 0, 0, 0x36, 0, 0, 0];
+        bmp.extend_from_slice(&[0; 32]);
+        let bmp = parse_binary_named(&bmp, false, Some("b.wnry")).unwrap();
+        assert_eq!(bmp.format, BinaryFormat::Image);
+        assert_eq!(bmp.architecture, "bmp");
+
+        let zip = parse_binary_named(b"PK\x03\x04\0\0\0\0payload", false, Some("s.wnry")).unwrap();
+        assert_eq!(zip.format, BinaryFormat::Zip);
+
+        let note = parse_binary_named(
+            b"Q:  What's wrong with my files?\nA:  Ooops, encrypted.\n",
+            false,
+            Some("r.wnry"),
+        )
+        .unwrap();
+        assert_eq!(note.format, BinaryFormat::Text, "ransom note must not be DOS COM");
+
+        let enc = parse_binary_named(b"WANACRY!\x00\x01\x00\x00ciphertext", false, Some("t.wnry"))
+            .unwrap();
+        assert_eq!(enc.format, BinaryFormat::Encrypted);
+        assert_eq!(enc.architecture, "wanacry");
     }
 }

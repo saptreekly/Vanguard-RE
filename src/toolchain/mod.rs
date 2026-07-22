@@ -151,9 +151,9 @@ pub fn identify(data: &[u8], binary: &ParsedBinary) -> Vec<ToolchainFinding> {
         // markers like Embarcadero still apply everywhere.
         if m.language == "Delphi/C++ Builder"
             && m.weight < 70
-            && matches!(
+            && !matches!(
                 binary.format,
-                BinaryFormat::Raw | BinaryFormat::Unknown | BinaryFormat::DosCom
+                BinaryFormat::Pe | BinaryFormat::Elf | BinaryFormat::MachO
             )
         {
             continue;

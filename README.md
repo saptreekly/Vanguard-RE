@@ -7,7 +7,7 @@ High-speed, memory-safe static malware triage from the command line.
 | Pillar | How |
 |--------|-----|
 | **Speed** | `memmap2` zero-copy I/O + focused static pipelines |
-| **Accuracy** | Formal PE / ELF / Mach-O parsing (`goblin`), ImpHash, Shannon entropy, IAT heuristics, iced-x86 disassembly, crypto fingerprints, network IOCs, toolchain fingerprinting |
+| **Accuracy** | Formal PE / ELF / Mach-O parsing (`goblin`), ImpHash, Shannon entropy, IAT heuristics, iced-x86 disassembly, crypto fingerprints, weak XOR recovery, network IOCs, toolchain fingerprinting |
 | **Safety** | Rust memory safety + in-memory quarantine — samples are never executed |
 
 ## Architecture
@@ -36,6 +36,7 @@ High-speed, memory-safe static malware triage from the command line.
 | **Credential recovery** | Cracks encrypted embedded ZIPs by trying the sample's own plaintext strings as passwords (recovers WannaCry's `WNcry@2ol7`), then unlocks + analyzes the payload |
 | **Possible secrets** | Heuristic password / API-key candidates ranked by character-class mix, entropy band, and word-stem shape (lead generator, not proof) |
 | **Crypto** | AES / ChaCha20 / SHA / MD5 / Blowfish / PEM / Base64 / CryptoAPI imports via constant tables |
+| **XOR recovery** | Deep-dive only: breaks short repeating XOR keys and reused keystreams via `C1⊕C2` cancel (“wave interference”); prints scheme, key, and recovered plaintext. Skips RTF/images/text; does **not** decrypt AES / `WANACRY!` / real ransomware crypto. `xor_loop` disasm hits raise confidence |
 | **Strings** | Ranked ASCII + UTF-16LE extraction (not first-N file order), ransomware / C2 keyword filter, import DLLs |
 | **Disassembly** | iced-x86 function recovery, interest ranking, k-means clusters, technique insights |
 | **Code analysis** | Automated technique flags: PEB access, API hashing, XOR loops, stack strings, direct syscalls, indirect dispatch |
@@ -59,6 +60,7 @@ Additional ranking rules:
 
 - **DOS COM** still gets a useful floor score; generic **Raw** blobs no longer auto-score 35
 - **Language packs** (`msg/m_*.wnry`, `.mui`, …), **non-PE `.wnry` resources** (`r.wnry`, configs — not `u.wnry`), and **source/build** (`.cpp`, `.tlog`, `.obj`, `.pdb`, …) are demoted so they cannot flood the ranking (skip with `--full`)
+- **Content formats** beyond PE/ELF/Mach-O are classified by magic: ZIP, RTF, images (BMP/PNG/JPEG), printable text/config, and known encrypted headers (`WANACRY!`) — the banner shows a per-format mix instead of a opaque `other=` count
 - **PE children of a high-score dropper** (score ≥ 70) get a floor of 40 so thin-IAT helpers like WannaCry `taskdl.exe` outrank demoted noise
 - **.NET** samples with high toolchain confidence get a managed score floor (50+ at conf ≥ 90; higher with stealer/obfuscator/managed-net strings)
 - **ELF / IoT bots** match IAT socket patterns when linked, and static/stripped loaders (Mirai `dlr.*`) get a string floor from markers like `MIRAI` / `GET /bins/mirai`
@@ -110,6 +112,16 @@ vanguard /path/to/sample.zip -p infected --full
 ```
 
 Stdout prints a structured report: banner summary, ranking table, ImpHash clusters, then one merged block per interesting sample (identity + triage + deep-dive). Defaults hide score-0 rows, CRT import noise, language-pack string spam, and low-interest triage; use `--full` for the complete dump.
+
+When weak XOR is recovered on a deep-dive, the sample block includes a named scheme plus key and plaintext:
+
+```
+  xor
+    single-byte XOR 0x4b  conf=82  @0x1a00  span=128 B
+      key    4b  "K"
+      plain  "http://evil.example/gate..."
+      note   IC L=1 (0.065); 94% printable
+```
 
 Passworded malware packs and ZIPs embedded inside binaries are decrypted into RAM only, then ranked, signature-scanned, and deep-dived — nothing is executed.
 

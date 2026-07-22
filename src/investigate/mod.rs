@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use crate::containment::{EmbeddedArchive, QuarantinedSample};
-use crate::crypto::{CryptoFinding, scan as scan_crypto};
+use crate::crypto::{CryptoFinding, XorRecovery, scan as scan_crypto, scan_pairwise_across, scan_xor};
 use crate::disasm::{DisasmReport, ExtractedString, disassemble, interesting_strings};
 use crate::heuristics::{CapabilityTag, ThreatScore, capability_summary, score_imports};
 use crate::iocs::{IocKind, NetworkIoc, scan_data as scan_iocs};
@@ -38,6 +38,8 @@ pub struct DeepDive {
     pub network_iocs: Vec<NetworkIoc>,
     /// Detected crypto schemes (constant fingerprints + crypto API imports).
     pub crypto: Vec<CryptoFinding>,
+    /// Weak XOR recoveries (repeating key / keystream reuse).
+    pub xor_recoveries: Vec<XorRecovery>,
     /// ZIP archives carved from this sample's own bytes (encrypted payload
     /// bundles such as WannaCry's `.wnry` set), listed even when undecryptable.
     pub embedded_archives: Vec<EmbeddedArchive>,
@@ -327,8 +329,23 @@ fn classify_content(path: &str, format: BinaryFormat) -> ContentClass {
         return ContentClass::LanguagePack;
     }
 
-    // Non-PE `.wnry` resources (r.wnry ransom note, configs) are not DOS COM.
-    // Keep `u.wnry` interesting even if format salvage fails; PE helpers stay PE.
+    // Non-executable content and leftover `.wnry` resources stay demoted.
+    // Keep `u.wnry` interesting when PE parse fails.
+    if matches!(
+        format,
+        BinaryFormat::Rtf
+            | BinaryFormat::Image
+            | BinaryFormat::Text
+            | BinaryFormat::Zip
+            | BinaryFormat::Encrypted
+    ) {
+        // Language-pack RTF (m_*.wnry) already caught above; other content is
+        // low-interest unless it is a PE payload.
+        if !(ext == "wnry" && file == "u.wnry") {
+            return ContentClass::LowInterestRaw;
+        }
+    }
+
     if ext == "wnry"
         && file != "u.wnry"
         && !matches!(
@@ -394,7 +411,12 @@ fn classify_content(path: &str, format: BinaryFormat) -> ContentClass {
 fn format_rank(format: BinaryFormat) -> u8 {
     match format {
         BinaryFormat::Pe | BinaryFormat::Elf | BinaryFormat::MachO | BinaryFormat::DosCom => 0,
-        BinaryFormat::Raw | BinaryFormat::Unknown => 1,
+        BinaryFormat::Zip | BinaryFormat::Encrypted => 1,
+        BinaryFormat::Rtf
+        | BinaryFormat::Image
+        | BinaryFormat::Text
+        | BinaryFormat::Raw
+        | BinaryFormat::Unknown => 2,
     }
 }
 
@@ -560,6 +582,11 @@ pub fn investigate(
         network_iocs.truncate(40);
 
         let crypto = scan_crypto(data, &r.binary.imports);
+        let xor_loop_hint = disasm
+            .as_ref()
+            .map(|d| d.insights.iter().any(|i| i.id == "xor_loop"))
+            .unwrap_or(false);
+        let xor_recoveries = scan_xor(data, &r.binary, &crypto, xor_loop_hint);
         let embedded_archives = embedded_by_label
             .get(r.path.as_str())
             .map(|a| a.to_vec())
@@ -577,12 +604,16 @@ pub fn investigate(
             interesting_strings: strings,
             network_iocs,
             crypto,
+            xor_recoveries,
             embedded_archives,
             secrets,
             grouped_imports,
             disasm,
         });
     }
+
+    // Pairwise keystream-reuse across sibling archive members (wave interference).
+    attach_cross_sample_xor(&mut deep_dives, &triage, &data_by_label);
 
     Ok(InvestigationReport {
         source: source.to_string(),
@@ -593,6 +624,61 @@ pub fn investigate(
         yara_by_sample,
         deep_dives,
     })
+}
+
+fn attach_cross_sample_xor(
+    deep_dives: &mut [DeepDive],
+    triage: &[TriageReport],
+    data_by_label: &BTreeMap<&str, &[u8]>,
+) {
+    use crate::triage::entropy::shannon_entropy;
+
+    let format_of = |path: &str| -> Option<BinaryFormat> {
+        triage.iter().find(|t| t.path == path).map(|t| t.binary.format)
+    };
+
+    let mut peers: Vec<(String, Vec<u8>)> = Vec::new();
+    for d in deep_dives.iter() {
+        let fmt = match format_of(&d.path) {
+            Some(f) => f,
+            None => continue,
+        };
+        if !matches!(
+            fmt,
+            BinaryFormat::Encrypted | BinaryFormat::Raw | BinaryFormat::Unknown
+        ) {
+            continue;
+        }
+        let Some(data) = data_by_label.get(d.path.as_str()) else {
+            continue;
+        };
+        if data.len() < 32 || data.len() > 256 * 1024 {
+            continue;
+        }
+        let e = shannon_entropy(&data[..data.len().min(4096)]);
+        if !(4.0..=7.6).contains(&e) {
+            continue;
+        }
+        peers.push((d.path.clone(), data.to_vec()));
+    }
+
+    if peers.len() < 2 {
+        return;
+    }
+
+    for rec in scan_pairwise_across(&peers) {
+        for dive in deep_dives.iter_mut() {
+            if !rec.peers.iter().any(|p| p == &dive.path) {
+                continue;
+            }
+            let dup = dive.xor_recoveries.iter().any(|x| {
+                x.method == rec.method && x.key == rec.key && x.peers == rec.peers
+            });
+            if !dup {
+                dive.xor_recoveries.push(rec.clone());
+            }
+        }
+    }
 }
 
 fn group_imports(imports: &[ImportEntry]) -> Vec<(String, Vec<String>)> {
@@ -723,11 +809,19 @@ mod tests {
     #[test]
     fn demotes_non_payload_wnry_doscom() {
         assert_eq!(
-            classify_content("embedded-1.zip::r.wnry", BinaryFormat::DosCom),
+            classify_content("embedded-1.zip::r.wnry", BinaryFormat::Text),
             ContentClass::LowInterestRaw
         );
         assert_eq!(
-            classify_content("c.wnry", BinaryFormat::Raw),
+            classify_content("c.wnry", BinaryFormat::Text),
+            ContentClass::LowInterestRaw
+        );
+        assert_eq!(
+            classify_content("m_english.wnry", BinaryFormat::Rtf),
+            ContentClass::LanguagePack
+        );
+        assert_eq!(
+            classify_content("b.wnry", BinaryFormat::Image),
             ContentClass::LowInterestRaw
         );
         // Encryptor PE stays interesting.
@@ -736,7 +830,7 @@ mod tests {
             ContentClass::Interesting
         );
         let mut threat = blank_threat(35);
-        apply_content_class_demotion("r.wnry", BinaryFormat::DosCom, &mut threat);
+        apply_content_class_demotion("r.wnry", BinaryFormat::Text, &mut threat);
         assert!(threat.score <= 10, "r.wnry should be demoted, got {}", threat.score);
         assert!(threat.label.contains("demoted"));
     }

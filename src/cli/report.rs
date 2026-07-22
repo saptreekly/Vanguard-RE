@@ -3,7 +3,7 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use vanguard_re::containment::{EmbeddedArchive, QuarantinedSample};
 use vanguard_re::investigate::{short_name, DeepDive, InvestigationReport};
-use vanguard_re::triage::{BinaryFormat, TriageReport};
+use vanguard_re::triage::TriageReport;
 
 /// Options controlling how much detail the CLI dumps.
 #[derive(Debug, Clone, Copy)]
@@ -38,34 +38,28 @@ pub fn print_report(
 
 fn print_banner(path: &Path, samples: &[QuarantinedSample], report: &InvestigationReport) {
     let total_bytes: u64 = samples.iter().map(|s| s.data.len() as u64).sum();
-    let pe = report
-        .triage
-        .iter()
-        .filter(|t| t.binary.format == BinaryFormat::Pe)
-        .count();
-    let elf = report
-        .triage
-        .iter()
-        .filter(|t| t.binary.format == BinaryFormat::Elf)
-        .count();
-    let macho = report
-        .triage
-        .iter()
-        .filter(|t| t.binary.format == BinaryFormat::MachO)
-        .count();
-    let other = samples.len().saturating_sub(pe + elf + macho);
+    let mut counts = std::collections::BTreeMap::<String, usize>::new();
+    for t in &report.triage {
+        *counts.entry(t.binary.format.to_string()).or_default() += 1;
+    }
+    let mix = if counts.is_empty() {
+        "none".into()
+    } else {
+        counts
+            .iter()
+            .map(|(k, n)| format!("{k}={n}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
 
     println!("VANGUARD-RE");
     println!("{RULE}");
     println!("  source   {}", path.display());
     println!(
-        "  members  {}  ·  {}  ·  pe={} elf={} macho={} other={}",
+        "  members  {}  ·  {}  ·  {}",
         samples.len(),
         human_bytes(total_bytes),
-        pe,
-        elf,
-        macho,
-        other
+        mix
     );
     if let Some((name, score, label)) = report.ranking.first() {
         println!(
@@ -182,12 +176,7 @@ fn print_samples(report: &InvestigationReport, opts: PrintOptions) {
 }
 
 fn should_print_sample(t: &TriageReport, opts: PrintOptions) -> bool {
-    opts.full
-        || t.threat.score >= 20
-        || matches!(
-            t.binary.format,
-            BinaryFormat::Pe | BinaryFormat::Elf | BinaryFormat::MachO
-        )
+    opts.full || t.threat.score >= 20 || t.binary.format.is_executable()
 }
 
 fn print_sample_block(t: &TriageReport, deep: Option<&DeepDive>, opts: PrintOptions) {
@@ -314,6 +303,31 @@ fn print_sample_block(t: &TriageReport, deep: Option<&DeepDive>, opts: PrintOpti
                 c.category.label(),
                 c.evidence
             );
+        }
+    }
+
+    if !d.xor_recoveries.is_empty() {
+        println!("  xor");
+        for x in &d.xor_recoveries {
+            let peers = if x.peers.is_empty() {
+                String::new()
+            } else {
+                format!("  peers={}", x.peers.join(","))
+            };
+            println!(
+                "    {}  conf={}  @0x{:x}  span={}{peers}",
+                x.scheme(),
+                x.confidence,
+                x.offset,
+                human_bytes(x.length as u64),
+            );
+            println!("      key    {}", x.key_display());
+            if !x.preview.is_empty() {
+                println!("      plain  \"{}\"", x.preview);
+            }
+            if !x.evidence.is_empty() {
+                println!("      note   {}", x.evidence);
+            }
         }
     }
 
