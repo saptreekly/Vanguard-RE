@@ -639,7 +639,12 @@ fn cluster_imphash(triage: &[TriageReport]) -> Vec<ImpHashCluster> {
 }
 
 pub fn short_name(path: &str) -> String {
-    path.rsplit("::").next().unwrap_or(path).to_string()
+    let leaf = path.rsplit("::").next().unwrap_or(path);
+    Path::new(leaf)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(leaf)
+        .to_string()
 }
 
 #[cfg(test)]
