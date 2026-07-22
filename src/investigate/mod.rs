@@ -327,6 +327,18 @@ fn classify_content(path: &str, format: BinaryFormat) -> ContentClass {
         return ContentClass::LanguagePack;
     }
 
+    // Non-PE `.wnry` resources (r.wnry ransom note, configs) are not DOS COM.
+    // Keep `u.wnry` interesting even if format salvage fails; PE helpers stay PE.
+    if ext == "wnry"
+        && file != "u.wnry"
+        && !matches!(
+            format,
+            BinaryFormat::Pe | BinaryFormat::Elf | BinaryFormat::MachO
+        )
+    {
+        return ContentClass::LowInterestRaw;
+    }
+
     if matches!(
         ext,
         "c" | "cc"
@@ -701,6 +713,27 @@ mod tests {
         let mut threat = blank_threat(35);
         apply_content_class_demotion("msg/m_chinese (simplified).wnry", BinaryFormat::Raw, &mut threat);
         assert_eq!(threat.score, 5);
+    }
+
+    #[test]
+    fn demotes_non_payload_wnry_doscom() {
+        assert_eq!(
+            classify_content("embedded-1.zip::r.wnry", BinaryFormat::DosCom),
+            ContentClass::LowInterestRaw
+        );
+        assert_eq!(
+            classify_content("c.wnry", BinaryFormat::Raw),
+            ContentClass::LowInterestRaw
+        );
+        // Encryptor PE stays interesting.
+        assert_eq!(
+            classify_content("u.wnry", BinaryFormat::Pe),
+            ContentClass::Interesting
+        );
+        let mut threat = blank_threat(35);
+        apply_content_class_demotion("r.wnry", BinaryFormat::DosCom, &mut threat);
+        assert!(threat.score <= 10, "r.wnry should be demoted, got {}", threat.score);
+        assert!(threat.label.contains("demoted"));
     }
 
     #[test]

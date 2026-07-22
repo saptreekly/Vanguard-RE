@@ -29,7 +29,7 @@ High-speed, memory-safe static malware triage from the command line.
 | Layer | Signals |
 |-------|---------|
 | **Triage** | PE/ELF/Mach-O headers, ImpHash, entropy / packer hints, IAT threat score, capability tags |
-| **Toolchain** | Source-language / compiler fingerprints (Go, Rust, .NET, MSVC via Rich header, GCC/MinGW, Delphi, VB6, Nim, AutoIt, PyInstaller) with the artifacts that matched |
+| **Toolchain** | Source-language / compiler fingerprints (Go, Rust, .NET, MSVC via Rich header, GCC/MinGW, Delphi, VB6, Nim, AutoIt, PyInstaller) with the artifacts that matched; weak Delphi strings (`Borland`, …) are ignored on Raw blobs |
 | **Signatures** | Lightweight builtin string/byte rules (no YARA-X / Wasmtime); Delphi section rule is gated on Delphi toolchain markers |
 | **Network IOCs** | Hardcoded IPv4 / `ip:port`, URLs, domains, `.onion`, emails, checksum-validated Bitcoin wallets — ranked by confidence; vendor schema / truncated-host noise is filtered |
 | **Embedded archives** | Carves ZIP signatures from executable/resource bytes, decrypts members in memory, and recursively analyzes them with bomb limits |
@@ -46,7 +46,7 @@ Threat scores come from IAT pattern matches and capability tags. Labels are buil
 
 | Capability id | Meaning |
 |---------------|---------|
-| `injection` | Process injection / hollowing APIs |
+| `injection` | Process injection / hollowing APIs (`VirtualAllocEx`, … — needs ≥2 hits; plain `VirtualAlloc` does not count) |
 | `http_client` | WinINet / WinHTTP / URLDownload |
 | `socket_client` | Winsock / BSD sockets (needs ≥2 hits; `send` does not match `SendMessageA`) |
 | `smb_enum` | Share / SMB discovery (`NetShareEnum`, …) |
@@ -58,11 +58,14 @@ Threat scores come from IAT pattern matches and capability tags. Labels are buil
 Additional ranking rules:
 
 - **DOS COM** still gets a useful floor score; generic **Raw** blobs no longer auto-score 35
-- **Language packs** (`msg/m_*.wnry`, `.mui`, …), **source/build** (`.cpp`, `.tlog`, `.obj`, `.pdb`, …) are demoted so they cannot flood the ranking (skip with `--full`)
+- **Language packs** (`msg/m_*.wnry`, `.mui`, …), **non-PE `.wnry` resources** (`r.wnry`, configs — not `u.wnry`), and **source/build** (`.cpp`, `.tlog`, `.obj`, `.pdb`, …) are demoted so they cannot flood the ranking (skip with `--full`)
 - **PE children of a high-score dropper** (score ≥ 70) get a floor of 40 so thin-IAT helpers like WannaCry `taskdl.exe` outrank demoted noise
 - **.NET** samples with high toolchain confidence get a managed score floor (50+ at conf ≥ 90; higher with stealer/obfuscator/managed-net strings)
 - **ELF / IoT bots** match IAT socket patterns when linked, and static/stripped loaders (Mirai `dlr.*`) get a string floor from markers like `MIRAI` / `GET /bins/mirai`
 - Equal scores prefer PE/ELF/Mach-O/DOS over Raw so source trees cannot win a tie
+- **`Ex` APIs are distinct** — `VirtualAlloc` does not match `VirtualAllocEx`; injection needs ≥2 corroborating APIs
+- Ranking labels prefer including a network capability (`smb_enum` / `socket_client` / `http_client` / `c2_suspect`) when matched
+- **Delphi toolchain** weak string markers (`Borland`, …) are ignored on Raw/source blobs; PE/ELF/Mach-O still accept them
 
 ## Build & install
 

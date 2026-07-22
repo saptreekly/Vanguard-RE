@@ -90,6 +90,8 @@ const SUSPICIOUS_APIS: &[&str] = &[
     "GetDC",
     "LoadLibraryA",
     "LoadLibraryW",
+    "LoadLibraryExA",
+    "LoadLibraryExW",
     "GetProcAddress",
     "VirtualProtect",
     "VirtualProtectEx",
@@ -199,6 +201,12 @@ const PATTERNS: &[Pattern] = &[
         required: &["LoadLibrary", "GetProcAddress"],
     },
     Pattern {
+        name: "dynamic_api_resolve_ex",
+        severity: 40,
+        description: "Dynamic API resolution (LoadLibraryEx + GetProcAddress)",
+        required: &["LoadLibraryEx", "GetProcAddress"],
+    },
+    Pattern {
         name: "service_persistence",
         severity: 65,
         description: "Windows service creation for persistence",
@@ -228,6 +236,10 @@ fn api_names(imports: &[ImportEntry]) -> Vec<String> {
 
 /// Normalize Win32/Unix API names so `CreateServiceA` ≡ `CreateService` and
 /// short needles like `send` do **not** match `SendMessageA`.
+///
+/// Deliberately does **not** strip trailing `Ex`: `VirtualAlloc` must not match
+/// `VirtualAllocEx`, and `LoadLibrary` must not match `LoadLibraryEx`. Call sites
+/// that want both list both names.
 pub(crate) fn normalize_api(name: &str) -> String {
     let mut s = name.to_ascii_lowercase();
     // Strip stdcall decoration: _Foo@8 / Foo@4
@@ -243,13 +255,6 @@ pub(crate) fn normalize_api(name: &str) -> String {
             if prev.is_ascii_alphabetic() {
                 s.pop();
             }
-        }
-    }
-    // Strip trailing Ex (CreateProcessEx, LoadLibraryEx, …).
-    if s.len() > 4 && s.ends_with("ex") {
-        let prev = s.as_bytes()[s.len() - 3];
-        if prev.is_ascii_alphabetic() {
-            s.truncate(s.len() - 2);
         }
     }
     s
@@ -334,6 +339,42 @@ fn risk_band(score: u8) -> &'static str {
     }
 }
 
+fn is_network_cap(id: &str) -> bool {
+    matches!(
+        id,
+        "smb_enum" | "socket_client" | "http_client" | "c2_suspect"
+    )
+}
+
+/// Pick up to 3 capability ids for the ranking label: highest confidence first,
+/// then prefer including one network-class tag when present so Conti-style SMB
+/// discovery is visible beside crypto/file_drop.
+fn label_capability_ids(capabilities: &[CapabilityTag]) -> Vec<&str> {
+    if capabilities.is_empty() {
+        return Vec::new();
+    }
+    let mut chosen: Vec<&str> = Vec::with_capacity(3);
+    chosen.push(capabilities[0].id.as_str());
+
+    if let Some(net) = capabilities
+        .iter()
+        .find(|c| is_network_cap(&c.id) && c.id != chosen[0])
+    {
+        chosen.push(net.id.as_str());
+    }
+
+    for cap in capabilities.iter().skip(1) {
+        if chosen.len() >= 3 {
+            break;
+        }
+        if chosen.contains(&cap.id.as_str()) {
+            continue;
+        }
+        chosen.push(cap.id.as_str());
+    }
+    chosen
+}
+
 /// Build prose from matched capabilities / behaviors so a score of 93 cannot
 /// claim "injection / hollow" when those patterns were never hit.
 fn compose_label(
@@ -342,8 +383,8 @@ fn compose_label(
     behaviors: &[BehaviorMatch],
 ) -> String {
     let band = risk_band(score);
-    if !capabilities.is_empty() {
-        let top: Vec<_> = capabilities.iter().take(3).map(|c| c.id.as_str()).collect();
+    let top = label_capability_ids(capabilities);
+    if !top.is_empty() {
         return format!("{band} — {}", top.join("/"));
     }
     if !behaviors.is_empty() {
@@ -379,6 +420,68 @@ mod tests {
     fn create_service_matches_ansi_wide() {
         assert!(api_matches("CreateServiceA", "CreateService"));
         assert!(api_matches("StartServiceW", "StartService"));
+    }
+
+    #[test]
+    fn virtual_alloc_does_not_match_virtual_alloc_ex() {
+        assert!(!api_matches("VirtualAlloc", "VirtualAllocEx"));
+        assert!(!api_matches("VirtualAllocA", "VirtualAllocEx"));
+        assert!(api_matches("VirtualAllocEx", "VirtualAllocEx"));
+        assert!(api_matches("VirtualAllocExW", "VirtualAllocEx"));
+        assert!(!api_matches("LoadLibraryExW", "LoadLibrary"));
+        assert!(api_matches("LoadLibraryExW", "LoadLibraryEx"));
+    }
+
+    #[test]
+    fn virtual_alloc_alone_is_not_injection() {
+        let score = score_imports(&imports(&[
+            "VirtualAlloc",
+            "QueryPerformanceCounter",
+            "IsDebuggerPresent",
+            "GetProcAddress",
+            "LoadLibraryExW",
+            "CryptAcquireContextA",
+            "CryptDecrypt",
+            "CryptImportKey",
+            "CreateFileW",
+            "WriteFile",
+            "NetShareEnum",
+        ]));
+        assert!(
+            !score.capabilities.iter().any(|c| c.id == "injection"),
+            "VirtualAlloc must not tag injection: {:?}",
+            score.capabilities
+        );
+        assert!(
+            score.capabilities.iter().any(|c| c.id == "smb_enum"),
+            "expected smb_enum: {:?}",
+            score.capabilities
+        );
+        assert!(
+            score.label.contains("smb_enum"),
+            "label should surface smb_enum: {}",
+            score.label
+        );
+        assert!(
+            !score.label.to_ascii_lowercase().contains("injection"),
+            "label invented injection: {}",
+            score.label
+        );
+    }
+
+    #[test]
+    fn virtual_alloc_ex_plus_write_still_tags_injection() {
+        let score = score_imports(&imports(&[
+            "VirtualAllocEx",
+            "WriteProcessMemory",
+            "CreateRemoteThread",
+        ]));
+        assert!(
+            score.capabilities.iter().any(|c| c.id == "injection"),
+            "classic triad should tag injection: {:?}",
+            score.capabilities
+        );
+        assert!(score.score >= 70, "injection triad score too low: {}", score.score);
     }
 
     #[test]

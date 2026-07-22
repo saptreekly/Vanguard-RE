@@ -40,7 +40,8 @@ const RULES: &[CapRule] = &[
             "NtMapViewOfSection",
             "VirtualProtectEx",
         ],
-        min_hits: 1,
+        // Classic triad needs corroboration — a lone VirtualAllocEx is common CRT.
+        min_hits: 2,
     },
     CapRule {
         id: "http_client",
@@ -173,7 +174,13 @@ const RULES: &[CapRule] = &[
     CapRule {
         id: "dyn_resolve",
         label: "Dynamic API resolve",
-        apis: &["LoadLibrary", "GetProcAddress", "LdrLoadDll", "LdrGetProcedureAddress"],
+        apis: &[
+            "LoadLibrary",
+            "LoadLibraryEx",
+            "GetProcAddress",
+            "LdrLoadDll",
+            "LdrGetProcedureAddress",
+        ],
         min_hits: 2,
     },
     CapRule {

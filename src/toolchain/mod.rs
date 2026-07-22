@@ -146,6 +146,18 @@ pub fn identify(data: &[u8], binary: &ParsedBinary) -> Vec<ToolchainFinding> {
 
     // 1) Byte markers.
     for m in MARKERS {
+        // Weak Delphi string hits (e.g. "Borland" in eSTREAM headers) fire on
+        // Raw source blobs. Require PE/ELF/Mach-O for weight < 70; strong
+        // markers like Embarcadero still apply everywhere.
+        if m.language == "Delphi/C++ Builder"
+            && m.weight < 70
+            && matches!(
+                binary.format,
+                BinaryFormat::Raw | BinaryFormat::Unknown | BinaryFormat::DosCom
+            )
+        {
+            continue;
+        }
         if contains_seq(window, m.needle) {
             bump(m.language, m.weight, m.evidence.to_string());
         }
@@ -318,7 +330,7 @@ fn contains_seq(hay: &[u8], needle: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::triage::parse_binary;
+    use crate::triage::{OperatingSystemEstimate, parse_binary};
 
     fn blob_with(markers: &[&[u8]]) -> Vec<u8> {
         let mut v = vec![0u8; 32];
@@ -370,5 +382,48 @@ mod tests {
     fn clean_blob_reports_nothing() {
         let data = blob_with(&[b"just some harmless text here"]);
         assert!(identify_raw(&data).is_empty());
+    }
+
+    #[test]
+    fn borland_string_ignored_on_raw_headers() {
+        // Conti ecrypt-config.h mentions Borland in eSTREAM commentary.
+        let data = blob_with(&[b"/* Written by ... for Borland C */", b"ECRYPT_VARIANT"]);
+        let f = identify_raw(&data);
+        assert!(
+            !f.iter().any(|x| x.language.contains("Delphi")),
+            "Raw Borland string must not tag Delphi: {f:?}"
+        );
+    }
+
+    #[test]
+    fn embarmadero_still_tags_delphi_on_pe() {
+        let data = blob_with(&[b"Embarcadero Technologies", b"SOFTWARE\\Borland\\Delphi"]);
+        let binary = ParsedBinary {
+            format: BinaryFormat::Pe,
+            architecture: "x86".into(),
+            operating_system: OperatingSystemEstimate {
+                family: "Windows".into(),
+                minimum_version: None,
+                environment: None,
+                evidence: "test".into(),
+            },
+            entry_point: 0,
+            is_64bit: false,
+            is_lib: false,
+            compile_timestamp: None,
+            has_signature: false,
+            image_file_offset: 0,
+            sections: vec![],
+            imports: vec![],
+            exports: vec![],
+            symbols: vec![],
+            section_entropies: vec![],
+            entropy_maps: vec![],
+        };
+        let f = identify(&data, &binary);
+        assert!(
+            f.iter().any(|x| x.language.contains("Delphi") && x.confidence >= 70),
+            "PE Embarcadero should tag Delphi: {f:?}"
+        );
     }
 }
