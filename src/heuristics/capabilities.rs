@@ -48,9 +48,11 @@ const RULES: &[CapRule] = &[
         label: "HTTP client",
         apis: &[
             "InternetOpen",
+            "InternetOpenUrl",
             "InternetConnect",
             "HttpSendRequest",
             "HttpOpenRequest",
+            "InternetReadFile",
             "WinHttpOpen",
             "WinHttpConnect",
             "WinHttpSendRequest",
@@ -93,6 +95,7 @@ const RULES: &[CapRule] = &[
         apis: &[
             "URLDownloadToFile",
             "InternetOpen",
+            "InternetOpenUrl",
             "HttpSendRequest",
             "WinHttpSendRequest",
             "InternetReadFile",
@@ -240,14 +243,13 @@ fn api_names(imports: &[ImportEntry]) -> Vec<String> {
         .collect()
 }
 
-/// Tag capabilities from imports (CAPA-style summary for triage).
-pub fn tag_capabilities(imports: &[ImportEntry]) -> Vec<CapabilityTag> {
-    let apis = api_names(imports);
+/// Tag capabilities from a flat list of API names (IAT and/or string evidence).
+pub fn tag_capabilities_from_names(apis: &[String]) -> Vec<CapabilityTag> {
     let mut tags = Vec::new();
 
     for rule in RULES {
         let mut evidence = Vec::new();
-        for api in &apis {
+        for api in apis {
             for needle in rule.apis {
                 if api_matches(api, needle) {
                     evidence.push(api.clone());
@@ -260,7 +262,6 @@ pub fn tag_capabilities(imports: &[ImportEntry]) -> Vec<CapabilityTag> {
         if evidence.len() < rule.min_hits {
             continue;
         }
-        // Confidence: base 40 + 12 per evidence hit, capped.
         let confidence = (40u8)
             .saturating_add((evidence.len().min(5) as u8).saturating_mul(12))
             .min(100);
@@ -274,6 +275,11 @@ pub fn tag_capabilities(imports: &[ImportEntry]) -> Vec<CapabilityTag> {
 
     tags.sort_by(|a, b| b.confidence.cmp(&a.confidence).then(a.id.cmp(&b.id)));
     tags
+}
+
+/// Tag capabilities from imports (CAPA-style summary for triage).
+pub fn tag_capabilities(imports: &[ImportEntry]) -> Vec<CapabilityTag> {
+    tag_capabilities_from_names(&api_names(imports))
 }
 
 /// Compact display list: `injection · socket_client · persistence`

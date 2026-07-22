@@ -112,6 +112,7 @@ fn entire_external_corpus_is_handled() {
                     disasm_count: 64,
                     yara_rules: None,
                     min_deep_score: 100,
+                    max_deep: 8,
                     full: false,
                 },
             )?;

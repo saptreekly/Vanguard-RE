@@ -36,6 +36,10 @@ struct Args {
     #[arg(long, default_value_t = 70)]
     min_deep_score: u8,
 
+    /// Absolute ceiling on deep-dives (top `--deep` plus min-score fill)
+    #[arg(long, default_value_t = 8)]
+    max_deep: usize,
+
     /// Keep language packs / source / raw noise in ranking, and print full
     /// member lists / triage for every sample
     #[arg(long, default_value_t = false)]
@@ -62,6 +66,7 @@ fn main() -> Result<()> {
             disasm_count: args.disasm_count,
             yara_rules: None,
             min_deep_score: args.min_deep_score,
+            max_deep: args.max_deep,
             full: args.full,
         },
     )?;

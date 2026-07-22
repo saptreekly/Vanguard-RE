@@ -48,6 +48,11 @@ pub fn scan(data: &[u8]) -> Vec<SecretCandidate> {
             continue;
         }
         if let Some(cand) = classify(&tok) {
+            if cand.kind == SecretKind::Password
+                && !password_keyword_nearby(data, offset, offset + tok.len())
+            {
+                continue;
+            }
             found
                 .entry(cand.value.clone())
                 .and_modify(|e| e.score = e.score.max(cand.score))
@@ -56,7 +61,7 @@ pub fn scan(data: &[u8]) -> Vec<SecretCandidate> {
     }
     let mut out: Vec<SecretCandidate> = found.into_values().collect();
     out.sort_by(|a, b| b.score.cmp(&a.score).then(a.value.cmp(&b.value)));
-    out.truncate(20);
+    out.truncate(8);
     out
 }
 
@@ -87,6 +92,25 @@ fn in_string_region(data: &[u8], start: usize, end: usize) -> bool {
         return false;
     }
     printable * 100 / total >= 60
+}
+
+/// True when a credential-ish keyword sits near the token (config / UI strings).
+fn password_keyword_nearby(data: &[u8], start: usize, end: usize) -> bool {
+    const PAD: usize = 96;
+    let from = start.saturating_sub(PAD);
+    let to = (end + PAD).min(data.len());
+    let window = data[from..to].to_ascii_lowercase();
+    const KEYS: &[&[u8]] = &[
+        b"password",
+        b"passwd",
+        b"pass:",
+        b"pwd",
+        b"secret",
+        b"credential",
+        b"login",
+        b"auth",
+    ];
+    KEYS.iter().any(|k| window.windows(k.len()).any(|w| w == *k))
 }
 
 /// Longest run of consecutive ASCII letters — a proxy for a word-like stem.
@@ -289,7 +313,7 @@ fn classify(s: &str) -> Option<SecretCandidate> {
     }
 
     let score = score.clamp(0, 100) as u8;
-    if score < 62 {
+    if score < 72 {
         return None;
     }
     Some(SecretCandidate {
@@ -309,16 +333,26 @@ mod tests {
 
     #[test]
     fn flags_wannacry_password() {
-        let data = b"junk data\x00WNcry@2ol7\x00KERNEL32.DLL";
+        let data = b"password\x00WNcry@2ol7\x00KERNEL32.DLL";
         let cands = scan(data);
         assert!(has(&cands, "WNcry@2ol7"), "should flag the WannaCry password");
     }
 
     #[test]
     fn flags_mixed_complexity_password() {
-        let data = b"config\x00Adm1n!Pass2024\x00end";
+        let data = b"login\x00Adm1n!Pass2024\x00end";
         let cands = scan(data);
         assert!(has(&cands, "Adm1n!Pass2024"));
+    }
+
+    #[test]
+    fn ignores_shaped_token_without_keyword() {
+        let data = b"xxxx\x00Adm1n!Pass2024\x00yyyy";
+        let cands = scan(data);
+        assert!(
+            !has(&cands, "Adm1n!Pass2024"),
+            "password-shaped token without nearby keyword must drop: {cands:?}"
+        );
     }
 
     #[test]

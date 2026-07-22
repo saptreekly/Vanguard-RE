@@ -25,6 +25,7 @@ fn friday_the_13th_com_ranks() {
             disasm_count: 16,
             yara_rules: None,
             min_deep_score: 70,
+            max_deep: 8,
             full: false,
         },
     )

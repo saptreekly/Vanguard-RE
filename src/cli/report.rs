@@ -333,7 +333,7 @@ fn print_sample_block(t: &TriageReport, deep: Option<&DeepDive>, opts: PrintOpti
 
     if !d.secrets.is_empty() {
         println!("  secrets");
-        for s in &d.secrets {
+        for s in d.secrets.iter().filter(|s| s.score >= 75).take(8) {
             println!("    {:>3}  [{}]  {}", s.score, s.kind.label(), s.value);
         }
     }

@@ -87,8 +87,15 @@ fn scan_lightweight(data: &[u8]) -> Vec<YaraMatch> {
     }
 
     if pe {
+        // Dyn-resolve / delay-load pattern: WinINet names as strings plus
+        // LoadLibrary+GetProcAddress. Ordinary IAT-linked apps still match
+        // substring scans, so require OpenUrl or ≥4 distinct WinINet names
+        // before emitting the (renamed) rule.
+        let has_dyn = contains_ascii_ci(data, b"LoadLibrary")
+            && contains_ascii_ci(data, b"GetProcAddress");
         let wininet = [
             b"InternetOpen".as_slice(),
+            b"InternetOpenUrl".as_slice(),
             b"InternetConnect".as_slice(),
             b"HttpOpenRequest".as_slice(),
             b"HttpSendRequest".as_slice(),
@@ -98,8 +105,9 @@ fn scan_lightweight(data: &[u8]) -> Vec<YaraMatch> {
             .iter()
             .filter(|s| contains_ascii_ci(data, s))
             .count();
-        if n >= 3 {
-            hits.push(hit("RAT_WinINet_C2_Imports", "medium"));
+        let has_openurl = contains_ascii_ci(data, b"InternetOpenUrl");
+        if has_dyn && n >= 3 && (has_openurl || n >= 4) {
+            hits.push(hit("WinINet_DynResolve_Strings", "medium"));
         }
 
         let has = |s: &[u8]| contains_ascii_ci(data, s);

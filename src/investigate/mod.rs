@@ -6,7 +6,7 @@ use std::path::Path;
 use crate::containment::{EmbeddedArchive, QuarantinedSample};
 use crate::crypto::{CryptoFinding, XorRecovery, scan as scan_crypto, scan_pairwise_across, scan_xor};
 use crate::disasm::{DisasmReport, ExtractedString, disassemble, interesting_strings};
-use crate::heuristics::{CapabilityTag, ThreatScore, capability_summary, score_imports};
+use crate::heuristics::{CapabilityTag, ThreatScore, capability_summary, score_imports_with_string_apis};
 use crate::iocs::{IocKind, NetworkIoc, scan_data as scan_iocs};
 use crate::secrets::{SecretCandidate, scan as scan_secrets};
 use crate::signatures::{YaraMatch, build_hash_bundle, scan_yara};
@@ -67,6 +67,8 @@ pub struct InvestigateOptions<'a> {
     pub disasm_count: usize,
     pub yara_rules: Option<&'a Path>,
     pub min_deep_score: u8,
+    /// Absolute ceiling on deep-dives (top `deep` plus min-score fill).
+    pub max_deep: usize,
     /// When true, skip content-class demotion (language packs, source, raw noise).
     pub full: bool,
 }
@@ -78,6 +80,7 @@ impl Default for InvestigateOptions<'_> {
             disasm_count: 512,
             yara_rules: None,
             min_deep_score: 70,
+            max_deep: 8,
             full: false,
         }
     }
@@ -90,7 +93,7 @@ pub fn triage_sample(
 ) -> Result<TriageReport> {
     let binary = parse_binary_named(&sample.data, entropy_map, Some(sample.label.as_str()))?;
     let hashes = build_hash_bundle(&sample.data, &binary.imports);
-    let mut threat = score_imports(&binary.imports);
+    let mut threat = score_imports_with_string_apis(&binary.imports, &sample.data);
     let demangled_symbols = crate::disasm::demangle_symbols(&binary.symbols);
     let mut packer_hints = detect_packer_hints(&binary);
     let toolchain = crate::toolchain::identify(&sample.data, &binary);
@@ -108,6 +111,7 @@ pub fn triage_sample(
 
     apply_managed_score_floor(&sample.data, &toolchain, &mut threat);
     apply_elf_bot_floor(&sample.data, &binary, &mut threat);
+    apply_native_stealer_string_floor(&sample.data, &binary, &mut threat);
     if !full {
         apply_content_class_demotion(&sample.label, binary.format, &mut threat);
     }
@@ -272,6 +276,61 @@ fn apply_elf_bot_floor(data: &[u8], binary: &crate::triage::ParsedBinary, threat
         threat.score = floor;
         threat.label = format!(
             "{} — {reason}",
+            if floor >= 70 {
+                "high risk"
+            } else {
+                "likely malicious tooling"
+            }
+        );
+    }
+}
+
+/// Native (non-.NET) stealers often resolve WinINet via GetProcAddress and keep
+/// browser loot paths as plaintext. When dyn_resolve is already tagged, promote
+/// samples that also carry classic browser-profile / loot markers.
+fn apply_native_stealer_string_floor(
+    data: &[u8],
+    binary: &crate::triage::ParsedBinary,
+    threat: &mut ThreatScore,
+) {
+    if binary.format != BinaryFormat::Pe || threat.score >= 70 {
+        return;
+    }
+    let has_dyn = threat.capabilities.iter().any(|c| c.id == "dyn_resolve");
+    if !has_dyn {
+        return;
+    }
+    let text = String::from_utf8_lossy(&data[..data.len().min(2 * 1024 * 1024)]).to_ascii_lowercase();
+    let markers = [
+        "login data",
+        "web data",
+        "\\cookies",
+        "cookies",
+        "local storage",
+        "wallet.dat",
+        "\\mozilla\\",
+        "google\\chrome",
+        "user data",
+        "autofill",
+        "credit_cards",
+        "password-check",
+    ];
+    let hits = markers.iter().filter(|m| text.contains(*m)).count();
+    if hits < 2 {
+        return;
+    }
+    let has_http = threat.capabilities.iter().any(|c| c.id == "http_client" || c.id == "c2_suspect");
+    let floor = if hits >= 4 && has_http {
+        70
+    } else if hits >= 3 || has_http {
+        60
+    } else {
+        55
+    };
+    if threat.score < floor {
+        threat.score = floor;
+        threat.label = format!(
+            "{} — dyn-resolve stealer strings×{hits}",
             if floor >= 70 {
                 "high risk"
             } else {
@@ -508,9 +567,14 @@ pub fn investigate(
         .map(|(path, hits)| (path.clone(), hits.clone()))
         .collect();
 
-    // Deep-dive: top `deep` by score, plus any remaining with score >= min_deep_score.
+    // Deep-dive: top `deep` by score, then fill remaining slots up to `max_deep`
+    // with samples scoring >= min_deep_score (prevents tied floors from exploding).
+    let ceiling = opts.max_deep.max(opts.deep);
     let mut deep_targets: Vec<&TriageReport> = triage.iter().take(opts.deep).collect();
     for r in triage.iter().skip(opts.deep) {
+        if deep_targets.len() >= ceiling {
+            break;
+        }
         if r.threat.score >= opts.min_deep_score {
             deep_targets.push(r);
         }

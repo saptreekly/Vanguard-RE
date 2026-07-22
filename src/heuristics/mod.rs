@@ -2,7 +2,9 @@
 
 mod capabilities;
 
-pub use capabilities::{capability_summary, tag_capabilities, CapabilityTag};
+pub use capabilities::{
+    capability_summary, tag_capabilities, tag_capabilities_from_names, CapabilityTag,
+};
 
 use crate::triage::ImportEntry;
 
@@ -57,8 +59,11 @@ const SUSPICIOUS_APIS: &[&str] = &[
     "CryptAcquireContextW",
     "InternetOpenA",
     "InternetOpenW",
+    "InternetOpenUrlA",
+    "InternetOpenUrlW",
     "InternetConnectA",
     "HttpSendRequestA",
+    "InternetReadFile",
     "URLDownloadToFileA",
     "URLDownloadToFileW",
     "WinExec",
@@ -177,6 +182,12 @@ const PATTERNS: &[Pattern] = &[
         required: &["InternetOpen", "HttpSendRequest"],
     },
     Pattern {
+        name: "network_http_openurl",
+        severity: 48,
+        description: "WinINet InternetOpenUrl client",
+        required: &["InternetOpenUrl"],
+    },
+    Pattern {
         name: "network_http_connect",
         severity: 55,
         description: "WinINet connect + HTTP send",
@@ -269,10 +280,126 @@ fn has_api(apis: &[String], needle: &str) -> bool {
     apis.iter().any(|a| api_matches(a, needle))
 }
 
+fn has_dyn_resolve(apis: &[String]) -> bool {
+    (has_api(apis, "LoadLibrary") || has_api(apis, "LoadLibraryEx") || has_api(apis, "LdrLoadDll"))
+        && (has_api(apis, "GetProcAddress") || has_api(apis, "LdrGetProcedureAddress"))
+}
+
+/// Exact WinINet / WinHTTP / URLMON names harvested from printable strings.
+/// Used when dyn-resolve stealers keep networking off the thin IAT.
+const STRING_NETWORK_APIS: &[&str] = &[
+    "InternetOpen",
+    "InternetOpenUrl",
+    "InternetConnect",
+    "HttpOpenRequest",
+    "HttpSendRequest",
+    "InternetReadFile",
+    "InternetCloseHandle",
+    "WinHttpOpen",
+    "WinHttpConnect",
+    "WinHttpOpenRequest",
+    "WinHttpSendRequest",
+    "WinHttpReadData",
+    "URLDownloadToFile",
+];
+
+/// Collect whole-string API names that match known network needles (ASCII + UTF-16LE).
+pub fn harvest_network_api_strings(data: &[u8]) -> Vec<String> {
+    let window = &data[..data.len().min(4 * 1024 * 1024)];
+    let mut found = Vec::new();
+    for s in ascii_runs(window, 6) {
+        for needle in STRING_NETWORK_APIS {
+            if api_matches(&s, needle) {
+                found.push(s.clone());
+                break;
+            }
+        }
+    }
+    for s in utf16le_runs(window, 6) {
+        for needle in STRING_NETWORK_APIS {
+            if api_matches(&s, needle) {
+                found.push(s.clone());
+                break;
+            }
+        }
+    }
+    found.sort();
+    found.dedup_by(|a, b| api_matches(a, b));
+    found
+}
+
+fn ascii_runs(data: &[u8], min_len: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut start = None;
+    for (i, &b) in data.iter().enumerate() {
+        if (0x20..=0x7e).contains(&b) {
+            if start.is_none() {
+                start = Some(i);
+            }
+        } else if let Some(s) = start.take() {
+            if i - s >= min_len {
+                if let Ok(v) = std::str::from_utf8(&data[s..i]) {
+                    out.push(v.to_string());
+                }
+            }
+        }
+    }
+    if let Some(s) = start {
+        if data.len() - s >= min_len {
+            if let Ok(v) = std::str::from_utf8(&data[s..]) {
+                out.push(v.to_string());
+            }
+        }
+    }
+    out
+}
+
+fn utf16le_runs(data: &[u8], min_chars: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 1 < data.len() {
+        let mut j = i;
+        let mut chars = Vec::new();
+        while j + 1 < data.len() {
+            let lo = data[j];
+            let hi = data[j + 1];
+            if hi == 0 && (0x20..=0x7e).contains(&lo) {
+                chars.push(lo as char);
+                j += 2;
+            } else {
+                break;
+            }
+        }
+        if chars.len() >= min_chars {
+            out.push(chars.iter().collect());
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
 /// Score a binary's import table against known malicious operational patterns.
 pub fn score_imports(imports: &[ImportEntry]) -> ThreatScore {
-    let apis = api_names(imports);
+    score_api_evidence(api_names(imports))
+}
 
+/// Like [`score_imports`], but also folds exact network API name strings when the
+/// IAT already shows dynamic resolution (thin-IAT / delay-load stealers).
+pub fn score_imports_with_string_apis(imports: &[ImportEntry], data: &[u8]) -> ThreatScore {
+    let mut apis = api_names(imports);
+    if has_dyn_resolve(&apis) {
+        for name in harvest_network_api_strings(data) {
+            if !apis.iter().any(|a| api_matches(a, &name)) {
+                apis.push(name);
+            }
+        }
+    }
+    score_api_evidence(apis)
+}
+
+fn score_api_evidence(apis: Vec<String>) -> ThreatScore {
     let suspicious_apis: Vec<String> = apis
         .iter()
         .filter(|a| SUSPICIOUS_APIS.iter().any(|s| api_matches(a, s)))
@@ -296,11 +423,9 @@ pub fn score_imports(imports: &[ImportEntry]) -> ThreatScore {
         }
     }
 
-    // Aggregate: max pattern severity, plus small bump for suspicious API density
     let max_sev = behaviors.iter().map(|b| b.severity).max().unwrap_or(0);
     let density_bump = (suspicious_apis.len().min(20) as u8).saturating_mul(2);
-    let capabilities = tag_capabilities(imports);
-    // Capability diversity bump (high-signal tags weigh more).
+    let capabilities = tag_capabilities_from_names(&apis);
     let cap_bump: u8 = capabilities
         .iter()
         .map(|c| match c.id.as_str() {
@@ -545,6 +670,48 @@ mod tests {
         assert!(
             score.capabilities.iter().any(|c| c.id == "socket_client"),
             "expected socket_client: {:?}",
+            score.capabilities
+        );
+    }
+
+    #[test]
+    fn string_resolved_wininet_tags_http_client() {
+        // Thin IAT: only dyn-resolve. Networking lives in plaintext API names.
+        let imports = imports(&["LoadLibraryA", "GetProcAddress"]);
+        let data = b"LoadLibraryA\0GetProcAddress\0InternetOpenUrlA\0HttpSendRequestA\0InternetReadFile\0";
+        let without = score_imports(&imports);
+        assert!(
+            !without.capabilities.iter().any(|c| c.id == "http_client"),
+            "IAT-only must not invent http_client: {:?}",
+            without.capabilities
+        );
+        let with = score_imports_with_string_apis(&imports, data);
+        assert!(
+            with.capabilities.iter().any(|c| c.id == "http_client"),
+            "string evidence should tag http_client: {:?}",
+            with.capabilities
+        );
+        assert!(
+            with.score > without.score,
+            "string evidence should raise score ({} vs {})",
+            with.score,
+            without.score
+        );
+        assert!(
+            with.label.contains("http_client") || with.label.contains("c2_suspect"),
+            "label should surface network cap: {}",
+            with.label
+        );
+    }
+
+    #[test]
+    fn string_apis_ignored_without_dyn_resolve() {
+        let imports = imports(&["CreateFileA", "WriteFile"]);
+        let data = b"InternetOpenUrlA\0HttpSendRequestA\0InternetReadFile\0";
+        let score = score_imports_with_string_apis(&imports, data);
+        assert!(
+            !score.capabilities.iter().any(|c| c.id == "http_client"),
+            "must not promote WinINet strings without dyn_resolve: {:?}",
             score.capabilities
         );
     }
