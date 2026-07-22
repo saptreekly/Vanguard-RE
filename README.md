@@ -91,7 +91,7 @@ vanguard <PATH> [--password infected] [--deep 3] [--disasm-count 4000] [--min-de
 | `--deep` | `3` | Number of top-scoring samples to deep-dive |
 | `--disasm-count` | `4000` | Max instructions to decode per deep-dive |
 | `--min-deep-score` | `70` | Minimum triage score required for a deep-dive |
-| `--full` | off | Keep language packs / source / raw noise in ranking (skip demotion) |
+| `--full` | off | Keep language packs / source / raw noise in ranking **and** print full member lists + every triage block |
 
 Examples:
 
@@ -105,11 +105,11 @@ vanguard /path/to/malware.exe --password ""
 # Deeper disassembly budget on the top hit
 vanguard /path/to/sample.zip --deep 1 --disasm-count 8000
 
-# Noisy dump: do not demote language packs / source / raw blobs
+# Noisy dump: no demotion + full member/triage listing
 vanguard /path/to/sample.zip -p infected --full
 ```
 
-Stdout reports ranking, ImpHash clusters, PE/ELF triage, then deep-dive sections (YARA, network IOCs, crypto, secrets, imports, strings, disasm insights).
+Stdout reports a compact summary (short names, human sizes), then ranking, ImpHash clusters, focused triage (PE/ELF/Mach-O and score ≥ 20 by default), then deep-dive sections (YARA, network IOCs, crypto, secrets, imports, strings, disasm insights). Use `--full` for every member and every triage block.
 
 Passworded malware packs and ZIPs embedded inside binaries are decrypted into RAM only, then ranked, signature-scanned, and deep-dived — nothing is executed.
 

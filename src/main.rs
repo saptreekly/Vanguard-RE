@@ -36,7 +36,8 @@ struct Args {
     #[arg(long, default_value_t = 70)]
     min_deep_score: u8,
 
-    /// Keep language packs / source / raw noise in ranking (skip demotion)
+    /// Keep language packs / source / raw noise in ranking, and print full
+    /// member lists / triage for every sample
     #[arg(long, default_value_t = false)]
     full: bool,
 }
@@ -65,6 +66,11 @@ fn main() -> Result<()> {
         },
     )?;
 
-    cli::print_report(&args.path, &samples, &report);
+    cli::print_report(
+        &args.path,
+        &samples,
+        &report,
+        cli::PrintOptions { full: args.full },
+    );
     Ok(())
 }

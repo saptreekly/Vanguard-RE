@@ -2,4 +2,4 @@
 
 mod report;
 
-pub use report::print_report;
+pub use report::{print_report, PrintOptions};
