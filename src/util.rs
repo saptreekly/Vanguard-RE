@@ -3,14 +3,27 @@
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use memmap2::Mmap;
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
+/// Refuse to ingest a single host file larger than this (DoS / sparse-file guard).
+pub const MAX_SAMPLE_BYTES: u64 = 512 * 1024 * 1024;
+
 /// Memory-map a file for zero-copy analysis.
 pub fn map_file(path: &Path) -> Result<Mmap> {
     let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let len = file
+        .metadata()
+        .with_context(|| format!("stat {}", path.display()))?
+        .len();
+    if len > MAX_SAMPLE_BYTES {
+        bail!(
+            "{} is {len} bytes; exceeds max sample size of {MAX_SAMPLE_BYTES} bytes",
+            path.display()
+        );
+    }
     // SAFETY: read-only mapping of a local file opened above; we never write
     // through the map, and the File stays open for the lifetime of Mmap.
     let mmap = unsafe { Mmap::map(&file) }
@@ -35,13 +48,16 @@ pub fn collect_targets(path: &Path, recursive: bool) -> Result<Vec<PathBuf>> {
     }
 
     let walker = if recursive {
-        WalkDir::new(path)
+        WalkDir::new(path).follow_links(false)
     } else {
-        WalkDir::new(path).max_depth(1)
+        WalkDir::new(path).max_depth(1).follow_links(false)
     };
 
     let mut out = Vec::new();
     for entry in walker.into_iter().filter_map(|e| e.ok()) {
+        if entry.path_is_symlink() {
+            continue;
+        }
         if entry.file_type().is_file() {
             out.push(entry.into_path());
         }
