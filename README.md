@@ -109,7 +109,7 @@ vanguard /path/to/sample.zip --deep 1 --disasm-count 8000
 vanguard /path/to/sample.zip -p infected --full
 ```
 
-Stdout reports a compact summary (short names, human sizes), then ranking, ImpHash clusters, focused triage (PE/ELF/Mach-O and score ≥ 20 by default), then deep-dive sections (YARA, network IOCs, crypto, secrets, imports, strings, disasm insights). Use `--full` for every member and every triage block.
+Stdout prints a structured report: banner summary, ranking table, ImpHash clusters, then one merged block per interesting sample (identity + triage + deep-dive). Defaults hide score-0 rows, CRT import noise, language-pack string spam, and low-interest triage; use `--full` for the complete dump.
 
 Passworded malware packs and ZIPs embedded inside binaries are decrypted into RAM only, then ranked, signature-scanned, and deep-dived — nothing is executed.
 
