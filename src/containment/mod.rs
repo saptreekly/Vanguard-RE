@@ -32,6 +32,11 @@ const MAX_MEMBER_SIZE: u64 = 128 * 1024 * 1024;
 const MAX_TOTAL_EXTRACTED: u64 = 512 * 1024 * 1024;
 /// Cap carved embedded ZIPs per sample to bound carve/parse work.
 const MAX_EMBEDDED_ZIPS: usize = 32;
+/// Cap total local-header probes when carving. Dense `PK\x03\x04` noise without
+/// a matching EOCD is a classic quadratic DoS against naïve scanners.
+const MAX_EMBEDDED_LOCAL_PROBES: usize = 4_096;
+/// Cap how far past a local-file header we will scan for an EOCD.
+const MAX_EOCD_SEARCH: usize = 16 * 1024 * 1024;
 /// Cap total quarantined samples retained for one investigation.
 const MAX_QUARANTINED_SAMPLES: usize = 2_048;
 
@@ -228,13 +233,22 @@ pub fn decrypt_zip_in_memory(
 /// Each returned range begins at a local-file header and ends after the EOCD
 /// record (including its comment). This avoids handing unrelated executable
 /// suffix bytes to the ZIP parser.
+///
+/// Malware can sprinkle `PK\x03\x04` throughout a blob. Without probe/search
+/// caps, each false local header would scan the remainder of the file for an
+/// EOCD — O(n²) CPU against a single sample. Bound both the number of local
+/// probes and the EOCD look-ahead window.
 fn embedded_zip_ranges(data: &[u8]) -> Vec<std::ops::Range<usize>> {
     const LOCAL: &[u8] = b"PK\x03\x04";
     const EOCD: &[u8] = b"PK\x05\x06";
     let mut ranges = Vec::new();
     let mut search_from = 0;
+    let mut probes = 0usize;
 
-    while search_from + LOCAL.len() <= data.len() && ranges.len() < MAX_EMBEDDED_ZIPS {
+    while search_from + LOCAL.len() <= data.len()
+        && ranges.len() < MAX_EMBEDDED_ZIPS
+        && probes < MAX_EMBEDDED_LOCAL_PROBES
+    {
         let Some(rel_start) = data[search_from..]
             .windows(LOCAL.len())
             .position(|w| w == LOCAL)
@@ -242,11 +256,13 @@ fn embedded_zip_ranges(data: &[u8]) -> Vec<std::ops::Range<usize>> {
             break;
         };
         let start = search_from + rel_start;
+        probes += 1;
+        let search_limit = (start.saturating_add(MAX_EOCD_SEARCH)).min(data.len());
         let mut eocd_from = start + LOCAL.len();
         let mut carved = None;
 
-        while eocd_from + 22 <= data.len() {
-            let Some(rel_eocd) = data[eocd_from..]
+        while eocd_from + 22 <= search_limit {
+            let Some(rel_eocd) = data[eocd_from..search_limit]
                 .windows(EOCD.len())
                 .position(|w| w == EOCD)
             else {
@@ -258,7 +274,9 @@ fn embedded_zip_ranges(data: &[u8]) -> Vec<std::ops::Range<usize>> {
             }
             let comment_len = u16::from_le_bytes([data[eocd + 20], data[eocd + 21]]) as usize;
             let end = eocd + 22 + comment_len;
-            if end <= data.len() {
+            // Reject absurd EOCD comments that would escape the sample or the
+            // look-ahead budget (attacker-controlled u16).
+            if end <= data.len() && end.saturating_sub(start) <= MAX_EOCD_SEARCH {
                 carved = Some(start..end);
                 break;
             }
@@ -751,11 +769,20 @@ fn is_unsafe_zip_path(name: &str) -> bool {
 
 fn sanitize_member_name(name: &str) -> String {
     // Flatten to a single path component for labels; reject traversal earlier.
-    let cleaned = name.replace('\0', "");
-    PathBuf::from(&cleaned)
+    // Strip C0/C1 controls so malware member names cannot hijack terminal output.
+    let cleaned: String = name
+        .chars()
+        .filter(|c| *c != '\0' && !c.is_control())
+        .collect();
+    let leaf = PathBuf::from(&cleaned)
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| cleaned.replace(['/', '\\'], "_"))
+        .unwrap_or_else(|| cleaned.replace(['/', '\\'], "_"));
+    if leaf.is_empty() {
+        "unnamed".into()
+    } else {
+        leaf
+    }
 }
 
 #[cfg(test)]
@@ -897,6 +924,32 @@ mod tests {
     fn ignores_incomplete_zip_signature() {
         let data = b"MZ...PK\x03\x04not-a-complete-archive";
         assert!(embedded_zip_ranges(data).is_empty());
+    }
+
+    #[test]
+    fn dense_pk_noise_carve_stays_bounded() {
+        // Quadratic-carve bomb: packed local headers, no EOCD. Must finish
+        // quickly under the probe/look-ahead caps (not scan O(n²)).
+        let n = 256 * 1024;
+        let mut data = vec![0u8; n];
+        for i in (0..n.saturating_sub(4)).step_by(4) {
+            data[i..i + 4].copy_from_slice(b"PK\x03\x04");
+        }
+        let started = std::time::Instant::now();
+        let ranges = embedded_zip_ranges(&data);
+        let elapsed = started.elapsed();
+        assert!(ranges.is_empty());
+        assert!(
+            elapsed < std::time::Duration::from_millis(750),
+            "dense PK carve took {elapsed:?}; probe/search caps likely regressing"
+        );
+    }
+
+    #[test]
+    fn sanitize_strips_control_chars_from_member_names() {
+        assert_eq!(sanitize_member_name("evil\x1b[31m.exe"), "evil[31m.exe");
+        assert_eq!(sanitize_member_name("a\nb.exe"), "ab.exe");
+        assert_eq!(sanitize_member_name("\x01\x02"), "unnamed");
     }
 
     #[test]

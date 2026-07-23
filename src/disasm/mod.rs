@@ -16,6 +16,10 @@ use crate::triage::{parse_binary, BinaryFormat, ParsedBinary};
 
 use cluster::{choose_k, function_features, kmeans, label_cluster, FEATURE_DIM};
 
+/// Hard ceiling on instructions decoded per deep-dive. Analysts can request a
+/// large `--disasm-count`, but unbounded decode + formatting is a memory DoS.
+pub const MAX_DISASM_INSTRUCTIONS: usize = 100_000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlowKind {
     Fallthrough,
@@ -228,6 +232,7 @@ pub fn disassemble(
     count: usize,
     with_strings: bool,
 ) -> Result<DisasmReport> {
+    let count = count.min(MAX_DISASM_INSTRUCTIONS);
     let binary = parse_binary(data, false)?;
     let start = start_va.unwrap_or(binary.entry_point);
 
@@ -598,10 +603,19 @@ pub fn extract_strings_only(data: &[u8]) -> Vec<ExtractedString> {
 }
 
 /// Ranked string extraction with an explicit retention cap.
+///
+/// Malware can flood a blob with short printable runs (`ABCDEF\\0` × millions).
+/// Extraction therefore hard-caps candidate count and per-string length *while
+/// scanning*, before ranking — never materialize an unbounded string table.
 pub fn extract_strings_ranked(data: &[u8], cap: usize) -> Vec<ExtractedString> {
+    // Collect more than `cap` so ranking still has headroom, but never unbounded.
+    let collect_cap = cap.saturating_mul(4).clamp(cap, MAX_STRING_CANDIDATES);
     // min_len 6 skips most 5-char entropy noise; UTF-16 same.
-    let mut strings = extract_ascii_strings(data, 6);
-    strings.extend(extract_utf16le_strings(data, 6));
+    let mut strings = extract_ascii_strings(data, 6, collect_cap);
+    let remaining = collect_cap.saturating_sub(strings.len());
+    if remaining > 0 {
+        strings.extend(extract_utf16le_strings(data, 6, remaining));
+    }
 
     strings.sort_by(|a, b| {
         string_quality(&b.value)
@@ -613,6 +627,12 @@ pub fn extract_strings_ranked(data: &[u8], cap: usize) -> Vec<ExtractedString> {
     strings.truncate(cap);
     strings
 }
+
+/// Hard ceiling on raw string candidates retained during a single scan.
+const MAX_STRING_CANDIDATES: usize = 32_768;
+/// Cap individual string length so a single printable run cannot become a
+/// multi-megabyte allocation.
+const MAX_STRING_LEN: usize = 4_096;
 
 /// Higher = more likely a real analyst-useful string (vs packer printable noise).
 fn string_quality(s: &str) -> u32 {
@@ -813,12 +833,16 @@ fn looks_like_domain(s: &str) -> bool {
         && !lower.contains("schemas.microsoft.com")
 }
 
-fn extract_ascii_strings(data: &[u8], min_len: usize) -> Vec<ExtractedString> {
+fn extract_ascii_strings(data: &[u8], min_len: usize, cap: usize) -> Vec<ExtractedString> {
     let mut out = Vec::new();
+    if cap == 0 {
+        return out;
+    }
     let mut start = None;
     let flush = |s: usize, end: usize, out: &mut Vec<ExtractedString>| {
         if end - s >= min_len {
-            if let Ok(v) = std::str::from_utf8(&data[s..end]) {
+            let clipped = end.min(s.saturating_add(MAX_STRING_LEN));
+            if let Ok(v) = std::str::from_utf8(&data[s..clipped]) {
                 out.push(ExtractedString {
                     offset: s as u64,
                     encoding: "ascii".into(),
@@ -836,22 +860,30 @@ fn extract_ascii_strings(data: &[u8], min_len: usize) -> Vec<ExtractedString> {
             }
         } else if let Some(s) = start.take() {
             flush(s, i, &mut out);
+            if out.len() >= cap {
+                return out;
+            }
         }
     }
     // Flush a run that reaches the end of the buffer.
-    if let Some(s) = start.take() {
-        flush(s, data.len(), &mut out);
+    if out.len() < cap {
+        if let Some(s) = start.take() {
+            flush(s, data.len(), &mut out);
+        }
     }
     out
 }
 
-fn extract_utf16le_strings(data: &[u8], min_chars: usize) -> Vec<ExtractedString> {
+fn extract_utf16le_strings(data: &[u8], min_chars: usize, cap: usize) -> Vec<ExtractedString> {
     let mut out = Vec::new();
+    if cap == 0 {
+        return out;
+    }
     let mut i = 0;
     while i + 1 < data.len() {
         let mut j = i;
         let mut chars = Vec::new();
-        while j + 1 < data.len() {
+        while j + 1 < data.len() && chars.len() < MAX_STRING_LEN {
             let lo = data[j];
             let hi = data[j + 1];
             if hi == 0 && (0x20..=0x7e).contains(&lo) {
@@ -868,6 +900,9 @@ fn extract_utf16le_strings(data: &[u8], min_chars: usize) -> Vec<ExtractedString
                 value: chars.iter().collect(),
                 xrefs: Vec::new(),
             });
+            if out.len() >= cap {
+                return out;
+            }
             i = j;
         } else {
             i += 1;
@@ -891,4 +926,44 @@ pub fn demangle_symbols(symbols: &[String]) -> Vec<String> {
         .take(100)
         .cloned()
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn string_flood_is_capped_during_scan() {
+        // Short printable runs would previously materialize millions of
+        // candidates before ranking/truncation.
+        let mut data = Vec::new();
+        while data.len() < 2 * 1024 * 1024 {
+            data.extend_from_slice(b"ABCDEF\0");
+        }
+        let strings = extract_strings_ranked(&data, 8000);
+        assert!(strings.len() <= 8000);
+        // Collection itself must stay under the hard candidate ceiling.
+        let raw = extract_ascii_strings(&data, 6, MAX_STRING_CANDIDATES + 10);
+        assert!(raw.len() <= MAX_STRING_CANDIDATES);
+    }
+
+    #[test]
+    fn long_printable_run_is_length_capped() {
+        let data = vec![b'A'; 64 * 1024];
+        let strings = extract_ascii_strings(&data, 6, 10);
+        assert_eq!(strings.len(), 1);
+        assert_eq!(strings[0].value.len(), MAX_STRING_LEN);
+    }
+
+    #[test]
+    fn disasm_count_is_hard_capped() {
+        assert_eq!(MAX_DISASM_INSTRUCTIONS, 100_000);
+        // Tiny DOS-ish blob: decode request far above the ceiling must not panic.
+        let data = [0x90u8; 64]; // nops
+        let report = disassemble("nop.bin", &data, Some(0), usize::MAX / 4, false);
+        // Raw blob may fail format locate; either Ok with ≤ ceiling or Err is fine.
+        if let Ok(r) = report {
+            assert!(r.instructions.len() <= MAX_DISASM_INSTRUCTIONS);
+        }
+    }
 }

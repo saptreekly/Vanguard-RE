@@ -29,8 +29,8 @@ struct Args {
     deep: usize,
 
     /// Max instructions to decode per deep-dive disassembly
-    #[arg(long, default_value_t = 4000)]
-    disasm_count: usize,
+    #[arg(long, default_value_t = 4000, value_parser = clap::value_parser!(u32).range(1..=100_000))]
+    disasm_count: u32,
 
     /// Minimum triage score required for a deep-dive
     #[arg(long, default_value_t = 70)]
@@ -63,7 +63,7 @@ fn main() -> Result<()> {
         &samples,
         InvestigateOptions {
             deep: args.deep,
-            disasm_count: args.disasm_count,
+            disasm_count: args.disasm_count as usize,
             yara_rules: None,
             min_deep_score: args.min_deep_score,
             max_deep: args.max_deep,

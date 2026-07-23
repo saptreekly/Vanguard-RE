@@ -135,7 +135,10 @@ Passworded malware packs and ZIPs embedded inside binaries are decrypted into RA
 - Recovered inner payloads (e.g. decrypted WannaCry `.wnry` files) are analyzed in RAM only, never dropped to disk as runnable files
 - Archive depth, member count, per-member/total bytes, central-directory scans, embedded-ZIP carves, and total sample count are capped; host files over 512 MiB are refused
 - ZIP member reads are hard-bounded on actual decompression (not just declared sizes) to blunt zip bombs
-- Path traversal / absolute / drive-style ZIP names are rejected; corpus walks do not follow symlinks
+- Embedded ZIP carving bounds local-header probes and EOCD look-ahead so dense `PK` noise cannot quadratic-DoS the scanner
+- String extraction caps candidate count and per-string length while scanning; `--disasm-count` is hard-capped at 100k
+- PE/ELF/Mach-O section / import / export tables are truncated when materializing triage structs
+- Path traversal / absolute / drive-style ZIP names are rejected; control characters are stripped from member labels; corpus walks do not follow symlinks
 - Dynamic analysis (if added later) would use a real microVM, not host exec
 
 ## License
