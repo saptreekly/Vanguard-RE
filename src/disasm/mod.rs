@@ -834,6 +834,7 @@ fn looks_like_domain(s: &str) -> bool {
 }
 
 fn extract_ascii_strings(data: &[u8], min_len: usize, cap: usize) -> Vec<ExtractedString> {
+    let cap = cap.min(MAX_STRING_CANDIDATES);
     let mut out = Vec::new();
     if cap == 0 {
         return out;
@@ -875,6 +876,7 @@ fn extract_ascii_strings(data: &[u8], min_len: usize, cap: usize) -> Vec<Extract
 }
 
 fn extract_utf16le_strings(data: &[u8], min_chars: usize, cap: usize) -> Vec<ExtractedString> {
+    let cap = cap.min(MAX_STRING_CANDIDATES);
     let mut out = Vec::new();
     if cap == 0 {
         return out;
