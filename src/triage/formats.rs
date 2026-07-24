@@ -7,6 +7,11 @@ use super::report::SectionInfo;
 use anyhow::{Context, Result, bail};
 use goblin::Object;
 
+/// Bound attacker-controlled header tables when materializing triage structs.
+const MAX_SECTIONS: usize = 512;
+const MAX_IMPORTS: usize = 8_192;
+const MAX_EXPORTS: usize = 8_192;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BinaryFormat {
     Pe,
@@ -441,6 +446,9 @@ fn parse_pe(data: &[u8], pe: goblin::pe::PE<'_>, with_map: bool) -> Result<Parse
     let mut entropy_maps = Vec::new();
 
     for sec in &pe.sections {
+        if sections.len() >= MAX_SECTIONS {
+            break;
+        }
         let name = String::from_utf8_lossy(&sec.name)
             .trim_end_matches('\0')
             .to_string();
@@ -466,6 +474,9 @@ fn parse_pe(data: &[u8], pe: goblin::pe::PE<'_>, with_map: bool) -> Result<Parse
 
     let mut imports = Vec::new();
     for import in &pe.imports {
+        if imports.len() >= MAX_IMPORTS {
+            break;
+        }
         imports.push(ImportEntry {
             library: import.dll.to_string(),
             function: import.name.to_string(),
@@ -476,6 +487,7 @@ fn parse_pe(data: &[u8], pe: goblin::pe::PE<'_>, with_map: bool) -> Result<Parse
         .exports
         .iter()
         .filter_map(|e| e.name.map(|n| n.to_string()))
+        .take(MAX_EXPORTS)
         .collect();
 
     let compile_timestamp = pe.header.coff_header.time_date_stamp.pipe_nonzero();
@@ -575,6 +587,9 @@ fn parse_elf(data: &[u8], elf: goblin::elf::Elf<'_>, with_map: bool) -> Result<P
     let mut entropy_maps = Vec::new();
 
     for sec in &elf.section_headers {
+        if sections.len() >= MAX_SECTIONS {
+            break;
+        }
         let name = elf
             .shdr_strtab
             .get_at(sec.sh_name)
@@ -605,6 +620,9 @@ fn parse_elf(data: &[u8], elf: goblin::elf::Elf<'_>, with_map: bool) -> Result<P
 
     let mut imports = Vec::new();
     for lib in &elf.libraries {
+        if imports.len() >= MAX_IMPORTS {
+            break;
+        }
         // ELF dynamic imports are symbol-level; record library with placeholder
         imports.push(ImportEntry {
             library: (*lib).to_string(),
@@ -613,6 +631,9 @@ fn parse_elf(data: &[u8], elf: goblin::elf::Elf<'_>, with_map: bool) -> Result<P
     }
     let version_libs = elf_version_lib_map(&elf);
     for (sym_idx, sym) in elf.dynsyms.iter().enumerate() {
+        if imports.len() >= MAX_IMPORTS {
+            break;
+        }
         if sym.is_import() {
             if let Some(name) = elf.dynstrtab.get_at(sym.st_name) {
                 let lib = elf_import_library(&elf, &version_libs, sym_idx);
@@ -629,6 +650,7 @@ fn parse_elf(data: &[u8], elf: goblin::elf::Elf<'_>, with_map: bool) -> Result<P
         .iter()
         .filter(|s| s.st_bind() == goblin::elf::sym::STB_GLOBAL && !s.is_import())
         .filter_map(|s| elf.dynstrtab.get_at(s.st_name).map(|n| n.to_string()))
+        .take(MAX_EXPORTS)
         .collect();
 
     let symbols: Vec<String> = elf
@@ -794,6 +816,9 @@ fn parse_macho(
 
     let segments = macho.segments.sections().flatten();
     for section_result in segments {
+        if sections.len() >= MAX_SECTIONS {
+            break;
+        }
         let (section, _data_opt) = section_result?;
         let name = section.name().unwrap_or("").to_string();
         let start = section.offset as usize;
@@ -819,6 +844,9 @@ fn parse_macho(
     let mut imports = Vec::new();
     if let Ok(imports_map) = macho.imports() {
         for imp in imports_map.iter() {
+            if imports.len() >= MAX_IMPORTS {
+                break;
+            }
             imports.push(ImportEntry {
                 library: imp.dylib.to_string(),
                 function: imp.name.to_string(),
@@ -829,7 +857,12 @@ fn parse_macho(
     let exports: Vec<String> = macho
         .exports()
         .ok()
-        .map(|exps| exps.iter().map(|e| e.name.to_string()).collect())
+        .map(|exps| {
+            exps.iter()
+                .map(|e| e.name.to_string())
+                .take(MAX_EXPORTS)
+                .collect()
+        })
         .unwrap_or_default();
 
     let symbols: Vec<String> = macho
