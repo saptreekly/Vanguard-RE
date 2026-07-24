@@ -25,20 +25,20 @@ struct Args {
     password: String,
 
     /// Number of top-scoring samples to deep-dive
-    #[arg(long, default_value_t = 3)]
-    deep: usize,
+    #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u32).range(1..=2_048))]
+    deep: u32,
 
     /// Max instructions to decode per deep-dive disassembly
-    #[arg(long, default_value_t = 4000)]
-    disasm_count: usize,
+    #[arg(long, default_value_t = 4000, value_parser = clap::value_parser!(u32).range(1..=100_000))]
+    disasm_count: u32,
 
     /// Minimum triage score required for a deep-dive
     #[arg(long, default_value_t = 70)]
     min_deep_score: u8,
 
     /// Absolute ceiling on deep-dives (top `--deep` plus min-score fill)
-    #[arg(long, default_value_t = 8)]
-    max_deep: usize,
+    #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u32).range(1..=2_048))]
+    max_deep: u32,
 
     /// Keep language packs / source / raw noise in ranking, and print full
     /// member lists / triage for every sample
@@ -62,11 +62,11 @@ fn main() -> Result<()> {
         &args.path.display().to_string(),
         &samples,
         InvestigateOptions {
-            deep: args.deep,
-            disasm_count: args.disasm_count,
+            deep: args.deep as usize,
+            disasm_count: args.disasm_count as usize,
             yara_rules: None,
             min_deep_score: args.min_deep_score,
-            max_deep: args.max_deep,
+            max_deep: args.max_deep as usize,
             full: args.full,
         },
     )?;
