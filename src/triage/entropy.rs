@@ -57,8 +57,18 @@ pub fn entropy_heatmap(data: &[u8], width: usize) -> String {
 }
 
 /// Classify a section by entropy threshold.
+///
+/// For huge sections, sample the leading bytes. Full-file Shannon over every
+/// PE/ELF section (attacker-controlled section tables can overlap the same
+/// raw bytes thousands of times) is a CPU DoS without changing triage utility.
 pub fn section_entropy(name: impl Into<String>, data: &[u8]) -> SectionEntropy {
-    let entropy = shannon_entropy(data);
+    const SAMPLE: usize = 256 * 1024;
+    let sample = if data.len() > SAMPLE {
+        &data[..SAMPLE]
+    } else {
+        data
+    };
+    let entropy = shannon_entropy(sample);
     SectionEntropy {
         name: name.into(),
         entropy,
