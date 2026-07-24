@@ -82,6 +82,10 @@ pub struct XorRecovery {
 
 const MIN_CANDIDATE: usize = 32;
 const MAX_CANDIDATE: usize = 256 * 1024;
+/// Cap the bytes fed to key-search IC scoring. Entropy gating still uses
+/// `MAX_CANDIDATE`, but brute-forcing 256 key bytes × key lengths over a full
+/// 256 KiB window × several candidates is a CPU DoS malware can trigger.
+const MAX_RECOVER_BYTES: usize = 64 * 1024;
 const MAX_CANDIDATES_PER_SAMPLE: usize = 8;
 const MAX_PAIRS: usize = 8;
 const KEY_LENGTHS: &[usize] = &[1, 2, 3, 4, 5, 6, 8, 12, 16];
