@@ -328,9 +328,13 @@ fn looks_mostly_text(data: &[u8]) -> bool {
         return true;
     }
     // Config blobs with a binary header + ASCII body (WannaCry c.wnry).
-    if data.windows(6).any(|w| w.eq_ignore_ascii_case(b".onion"))
-        || data.windows(7).any(|w| w.eq_ignore_ascii_case(b"http://"))
-        || data.windows(8).any(|w| w.eq_ignore_ascii_case(b"https://"))
+    // Bound the probe — full-sample `.onion`/`http` window scans on a 512 MiB
+    // raw blob are a cheap malware-triggered CPU DoS during triage.
+    const TEXT_PROBE: usize = 64 * 1024;
+    let probe = &data[..data.len().min(TEXT_PROBE)];
+    if probe.windows(6).any(|w| w.eq_ignore_ascii_case(b".onion"))
+        || probe.windows(7).any(|w| w.eq_ignore_ascii_case(b"http://"))
+        || probe.windows(8).any(|w| w.eq_ignore_ascii_case(b"https://"))
     {
         return true;
     }
