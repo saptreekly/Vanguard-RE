@@ -505,7 +505,7 @@ fn list_zip_members<R: Read + Seek>(reader: R) -> Result<Vec<EmbeddedMember>> {
         members.push(EmbeddedMember {
             // Keep path-ish names for triage, but strip controls so malware
             // cannot hijack the analyst terminal via ANSI/C0 in CD names.
-            name: strip_controls(meta.name()),
+            name: sanitize_display_label(meta.name()),
             size: meta.size(),
             encrypted: meta.encrypted(),
         });
