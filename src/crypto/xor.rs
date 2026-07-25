@@ -140,7 +140,9 @@ pub fn collect_candidates(data: &[u8], binary: &ParsedBinary) -> Vec<XorCandidat
                 if start >= data.len() || len == 0 {
                     continue;
                 }
-                let end = (start + len).min(data.len());
+                // Attacker-controlled section sizes can wrap `start + len` on
+                // 32-bit or panic on overflow in debug; always saturate.
+                let end = start.saturating_add(len).min(data.len());
                 let slice = &data[start..end];
                 maybe_push_window(&mut out, &sec.name, start, slice);
             }

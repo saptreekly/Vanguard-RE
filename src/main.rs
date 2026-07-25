@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use vanguard_re::containment::collect_samples;
 use vanguard_re::investigate::{InvestigateOptions, investigate};
+use vanguard_re::sanitize_display_label;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -55,11 +56,12 @@ fn main() -> Result<()> {
         Some(args.password.as_str())
     };
 
+    let source_label = sanitize_display_label(&args.path.display().to_string());
     let samples = collect_samples(&args.path, false, password)
-        .with_context(|| format!("collect {}", args.path.display()))?;
+        .with_context(|| format!("collect {source_label}"))?;
 
     let report = investigate(
-        &args.path.display().to_string(),
+        &source_label,
         &samples,
         InvestigateOptions {
             deep: args.deep as usize,

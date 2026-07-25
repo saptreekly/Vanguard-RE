@@ -22,13 +22,13 @@ pub fn scan_yara_file(data: &[u8], rules_path: Option<&std::path::Path>) -> Vec<
     hits
 }
 
+/// Cap every builtin signature probe. Malware can force dozens of
+/// case-insensitive substring scans; without a window a 512 MiB PE becomes a
+/// multi-gigabyte CPU bill during the YARA-like pass alone.
+const SCAN_WINDOW: usize = 8 * 1024 * 1024;
+
 fn ascii_lower_lossy(data: &[u8]) -> String {
-    // Cap scan window so huge samples stay cheap.
-    let slice = if data.len() > 8 * 1024 * 1024 {
-        &data[..8 * 1024 * 1024]
-    } else {
-        data
-    };
+    let slice = &data[..data.len().min(SCAN_WINDOW)];
     String::from_utf8_lossy(slice).to_ascii_lowercase()
 }
 
@@ -59,6 +59,8 @@ fn hit(rule: &str, severity: &str) -> YaraMatch {
 fn scan_lightweight(data: &[u8]) -> Vec<YaraMatch> {
     let text = ascii_lower_lossy(data);
     let pe = is_pe(data);
+    // PE byte probes share the same window as the lowercased text scan.
+    let pe_window = &data[..data.len().min(SCAN_WINDOW)];
     let mut hits = Vec::new();
 
     // ElectroRAT / Electron RAT string indicators — need ≥3
@@ -91,8 +93,8 @@ fn scan_lightweight(data: &[u8]) -> Vec<YaraMatch> {
         // LoadLibrary+GetProcAddress. Ordinary IAT-linked apps still match
         // substring scans, so require OpenUrl or ≥4 distinct WinINet names
         // before emitting the (renamed) rule.
-        let has_dyn = contains_ascii_ci(data, b"LoadLibrary")
-            && contains_ascii_ci(data, b"GetProcAddress");
+        let has_dyn = contains_ascii_ci(pe_window, b"LoadLibrary")
+            && contains_ascii_ci(pe_window, b"GetProcAddress");
         let wininet = [
             b"InternetOpen".as_slice(),
             b"InternetOpenUrl".as_slice(),
@@ -103,14 +105,14 @@ fn scan_lightweight(data: &[u8]) -> Vec<YaraMatch> {
         ];
         let n = wininet
             .iter()
-            .filter(|s| contains_ascii_ci(data, s))
+            .filter(|s| contains_ascii_ci(pe_window, s))
             .count();
-        let has_openurl = contains_ascii_ci(data, b"InternetOpenUrl");
+        let has_openurl = contains_ascii_ci(pe_window, b"InternetOpenUrl");
         if has_dyn && n >= 3 && (has_openurl || n >= 4) {
             hits.push(hit("WinINet_DynResolve_Strings", "medium"));
         }
 
-        let has = |s: &[u8]| contains_ascii_ci(data, s);
+        let has = |s: &[u8]| contains_ascii_ci(pe_window, s);
         let inj = has(b"VirtualAllocEx")
             && has(b"WriteProcessMemory")
             && (has(b"CreateRemoteThread") || has(b"SetThreadContext"));
@@ -122,22 +124,22 @@ fn scan_lightweight(data: &[u8]) -> Vec<YaraMatch> {
 
         if ["WSAStartup", "socket", "connect", "send", "recv"]
             .iter()
-            .all(|s| contains_ascii_ci(data, s.as_bytes()))
+            .all(|s| contains_ascii_ci(pe_window, s.as_bytes()))
         {
             hits.push(hit("RAT_Socket_Client", "medium"));
         }
 
         // Gate behind Delphi toolchain markers — bare CODE/DATA/.idata also
         // appears in ordinary MSVC binaries and caused Conti/WannaCry FPs.
-        let delphiish = contains_ascii_ci(data, b"Embarcadero")
-            || contains_ascii_ci(data, b"Borland")
-            || contains_ascii_ci(data, b"System.pas")
-            || contains_ascii_ci(data, b"SysInit")
-            || contains_ascii_ci(data, b"TApplication");
+        let delphiish = contains_ascii_ci(pe_window, b"Embarcadero")
+            || contains_ascii_ci(pe_window, b"Borland")
+            || contains_ascii_ci(pe_window, b"System.pas")
+            || contains_ascii_ci(pe_window, b"SysInit")
+            || contains_ascii_ci(pe_window, b"TApplication");
         if delphiish
-            && contains_ascii_ci(data, b"CODE")
-            && contains_ascii_ci(data, b"DATA")
-            && contains_ascii_ci(data, b".idata")
+            && contains_ascii_ci(pe_window, b"CODE")
+            && contains_ascii_ci(pe_window, b"DATA")
+            && contains_ascii_ci(pe_window, b".idata")
         {
             hits.push(hit("Suspicious_Delphi_CODE_Section", "low"));
         }
