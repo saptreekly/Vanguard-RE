@@ -3,6 +3,7 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use vanguard_re::containment::{EmbeddedArchive, QuarantinedSample};
 use vanguard_re::investigate::{short_name, DeepDive, InvestigationReport};
+use vanguard_re::sanitize_display_label;
 use vanguard_re::triage::TriageReport;
 
 /// Options controlling how much detail the CLI dumps.
@@ -54,7 +55,10 @@ fn print_banner(path: &Path, samples: &[QuarantinedSample], report: &Investigati
 
     println!("VANGUARD-RE");
     println!("{RULE}");
-    println!("  source   {}", path.display());
+    println!(
+        "  source   {}",
+        sanitize_display_label(&path.display().to_string())
+    );
     println!(
         "  members  {}  ·  {}  ·  {}",
         samples.len(),
@@ -539,7 +543,7 @@ fn member_path(path: &str) -> String {
 
 /// Short label for tables: basename, with hash-like names compacted.
 fn display_name(path: &str) -> String {
-    let name = short_name(path);
+    let name = short_name(&sanitize_display_label(path));
     compact_hash_name(&name)
 }
 
