@@ -318,6 +318,9 @@ fn dedupe_findings(findings: &mut Vec<XorRecovery>) {
 /// Guess repeating key length via IC shortlist, then pick the length whose
 /// decrypt scores best (prefers shorter keys when multiples tie on IC).
 pub fn recover_repeating(data: &[u8], offset: usize) -> Option<XorRecovery> {
+    // Key-byte search is O(key_len × 256 × n); keep the recovery window small
+    // even when candidate collection retained a larger entropy-scored slice.
+    let data = &data[..data.len().min(MAX_RECOVER_BYTES)];
     if data.len() < MIN_CANDIDATE {
         return None;
     }
@@ -617,7 +620,7 @@ pub fn recover_key_reuse(
     label1: &str,
     label2: &str,
 ) -> Option<XorRecovery> {
-    let n = c1.len().min(c2.len());
+    let n = c1.len().min(c2.len()).min(MAX_RECOVER_BYTES);
     if n < MIN_CANDIDATE {
         return None;
     }
