@@ -131,9 +131,13 @@ const SECTION_RULES: &[SectionRule] = &[
     SectionRule { language: "Delphi/C++ Builder", needle: ".didata", weight: 40, evidence: ".didata section" },
 ];
 
+/// Marker scan window. Aligned with builtin signature probes — enough to catch
+/// toolchain strings without letting malware force dozens of 32 MiB walks.
+const MARKER_SCAN_WINDOW: usize = 8 * 1024 * 1024;
+
 /// Run all fingerprint passes and return languages ranked by confidence.
 pub fn identify(data: &[u8], binary: &ParsedBinary) -> Vec<ToolchainFinding> {
-    let window = &data[..data.len().min(32 * 1024 * 1024)];
+    let window = &data[..data.len().min(MARKER_SCAN_WINDOW)];
     let mut acc: BTreeMap<&'static str, (u32, Vec<String>)> = BTreeMap::new();
 
     let mut bump = |language: &'static str, weight: u8, evidence: String| {
@@ -144,24 +148,13 @@ pub fn identify(data: &[u8], binary: &ParsedBinary) -> Vec<ToolchainFinding> {
         }
     };
 
-    // 1) Byte markers.
-    for m in MARKERS {
-        // Weak Delphi string hits (e.g. "Borland" in eSTREAM headers) fire on
-        // Raw source blobs. Require PE/ELF/Mach-O for weight < 70; strong
-        // markers like Embarcadero still apply everywhere.
-        if m.language == "Delphi/C++ Builder"
-            && m.weight < 70
-            && !matches!(
-                binary.format,
-                BinaryFormat::Pe | BinaryFormat::Elf | BinaryFormat::MachO
-            )
-        {
-            continue;
-        }
-        if contains_seq(window, m.needle) {
-            bump(m.language, m.weight, m.evidence.to_string());
-        }
-    }
+    // 1) Byte markers — single pass over the window with a first-byte index so
+    // malware cannot force O(markers × n) independent full-file scans.
+    let allow_weak_delphi = matches!(
+        binary.format,
+        BinaryFormat::Pe | BinaryFormat::Elf | BinaryFormat::MachO
+    );
+    scan_markers(window, allow_weak_delphi, &mut bump);
 
     // 2) Import DLLs + CLR entrypoints.
     for imp in &binary.imports {
@@ -310,21 +303,46 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     (0..=hay.len() - n).find(|&i| &hay[i..i + n] == needle)
 }
 
-/// Substring search with a cheap first-byte skip.
-fn contains_seq(hay: &[u8], needle: &[u8]) -> bool {
-    let n = needle.len();
-    if n == 0 || hay.len() < n {
-        return false;
+/// Single-pass multi-needle scan. Buckets markers by first byte so each input
+/// position only checks a small subset instead of every marker.
+fn scan_markers(
+    hay: &[u8],
+    allow_weak_delphi: bool,
+    bump: &mut dyn FnMut(&'static str, u8, String),
+) {
+    let mut by_first: [Vec<usize>; 256] = std::array::from_fn(|_| Vec::new());
+    let mut remaining = 0usize;
+    for (idx, m) in MARKERS.iter().enumerate() {
+        // Weak Delphi string hits (e.g. "Borland" in eSTREAM headers) fire on
+        // Raw source blobs. Require PE/ELF/Mach-O for weight < 70; strong
+        // markers like Embarcadero still apply everywhere.
+        if m.language == "Delphi/C++ Builder" && m.weight < 70 && !allow_weak_delphi {
+            continue;
+        }
+        if let Some(&first) = m.needle.first() {
+            by_first[first as usize].push(idx);
+            remaining += 1;
+        }
     }
-    let first = needle[0];
-    let mut i = 0;
-    while i + n <= hay.len() {
-        if hay[i] == first && &hay[i..i + n] == needle {
-            return true;
+
+    // Track which markers already fired so we do not re-bump on every hit.
+    let mut fired = [false; MARKERS.len()];
+    let mut i = 0usize;
+    while i < hay.len() && remaining > 0 {
+        for &idx in &by_first[hay[i] as usize] {
+            if fired[idx] {
+                continue;
+            }
+            let m = &MARKERS[idx];
+            let n = m.needle.len();
+            if i + n <= hay.len() && &hay[i..i + n] == m.needle {
+                fired[idx] = true;
+                remaining = remaining.saturating_sub(1);
+                bump(m.language, m.weight, m.evidence.to_string());
+            }
         }
         i += 1;
     }
-    false
 }
 
 #[cfg(test)]
@@ -392,6 +410,21 @@ mod tests {
         assert!(
             !f.iter().any(|x| x.language.contains("Delphi")),
             "Raw Borland string must not tag Delphi: {f:?}"
+        );
+    }
+
+    #[test]
+    fn marker_scan_stays_bounded_on_dense_noise() {
+        // 8 MiB of a byte that matches no marker first-byte — must finish quickly
+        // under the single-pass scanner (old O(markers×n) would be much slower).
+        let data = vec![b'x'; MARKER_SCAN_WINDOW];
+        let started = std::time::Instant::now();
+        let f = identify_raw(&data);
+        let elapsed = started.elapsed();
+        assert!(f.is_empty());
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "marker scan took {elapsed:?}; single-pass / window caps likely regressing"
         );
     }
 

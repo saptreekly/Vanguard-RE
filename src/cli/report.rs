@@ -223,15 +223,28 @@ fn print_sample_block(t: &TriageReport, deep: Option<&DeepDive>, opts: PrintOpti
     }
 
     if let Some(tc) = t.toolchain.first() {
+        let evidence = tc
+            .evidence
+            .iter()
+            .take(3)
+            .map(|e| sanitize_display_label(e))
+            .collect::<Vec<_>>()
+            .join("; ");
         println!(
             "  toolchain {} (conf {}) — {}",
-            tc.language,
+            sanitize_display_label(&tc.language),
             tc.confidence,
-            tc.evidence.iter().take(3).cloned().collect::<Vec<_>>().join("; ")
+            evidence
         );
     }
     if !t.packer_hints.is_empty() {
-        println!("  packer   {}", t.packer_hints.join("; "));
+        let hints = t
+            .packer_hints
+            .iter()
+            .map(|h| sanitize_display_label(h))
+            .collect::<Vec<_>>()
+            .join("; ");
+        println!("  packer   {hints}");
     }
 
     if !t.binary.sections.is_empty() {
@@ -247,7 +260,7 @@ fn print_sample_block(t: &TriageReport, deep: Option<&DeepDive>, opts: PrintOpti
             let flag = if ent >= 7.0 { "  packed?" } else { "" };
             println!(
                 "    {:<10}  raw={:<10}  entropy={:.2}{flag}",
-                s.name,
+                sanitize_display_label(&s.name),
                 human_bytes(s.raw_size),
                 ent
             );
@@ -292,7 +305,7 @@ fn print_sample_block(t: &TriageReport, deep: Option<&DeepDive>, opts: PrintOpti
                 "    {:>5}  conf={:<3}  {}{priv_mark}",
                 ioc.kind.label(),
                 ioc.confidence,
-                ioc.value
+                sanitize_display_label(&ioc.value)
             );
         }
     }
@@ -325,12 +338,15 @@ fn print_sample_block(t: &TriageReport, deep: Option<&DeepDive>, opts: PrintOpti
                 x.offset,
                 human_bytes(x.length as u64),
             );
-            println!("      key    {}", x.key_display());
+            println!("      key    {}", sanitize_display_label(&x.key_display()));
             if !x.preview.is_empty() {
-                println!("      plain  \"{}\"", x.preview);
+                println!(
+                    "      plain  \"{}\"",
+                    sanitize_display_label(&x.preview)
+                );
             }
             if !x.evidence.is_empty() {
-                println!("      note   {}", x.evidence);
+                println!("      note   {}", sanitize_display_label(&x.evidence));
             }
         }
     }
@@ -338,7 +354,12 @@ fn print_sample_block(t: &TriageReport, deep: Option<&DeepDive>, opts: PrintOpti
     if !d.secrets.is_empty() {
         println!("  secrets");
         for s in d.secrets.iter().filter(|s| s.score >= 75).take(8) {
-            println!("    {:>3}  [{}]  {}", s.score, s.kind.label(), s.value);
+            println!(
+                "    {:>3}  [{}]  {}",
+                s.score,
+                s.kind.label(),
+                sanitize_display_label(&s.value)
+            );
         }
     }
 
@@ -409,25 +430,26 @@ fn print_imports(grouped: &[(String, Vec<String>)], opts: PrintOptions) {
             || lower.contains("ucrt")
             || lower.contains("vcruntime")
             || lower == "libgcc_s_dw2-1.dll";
+        let safe_lib = sanitize_display_label(lib);
         if is_crt && !opts.full {
-            println!("    {lib}  ({} crt helpers — hidden, use --full)", fns.len());
+            println!(
+                "    {safe_lib}  ({} crt helpers — hidden, use --full)",
+                fns.len()
+            );
             continue;
         }
-        let interesting: Vec<&String> = fns
+        let interesting: Vec<String> = fns
             .iter()
             .filter(|f| opts.full || !is_mangled(f))
+            .map(|f| sanitize_display_label(f))
             .collect();
         if interesting.is_empty() {
-            println!("    {lib}  ({} fns)", fns.len());
+            println!("    {safe_lib}  ({} fns)", fns.len());
             continue;
         }
-        println!("    {lib}  ({})", interesting.len());
+        println!("    {safe_lib}  ({})", interesting.len());
         // Wrap roughly.
-        let joined = interesting
-            .iter()
-            .map(|s| s.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
+        let joined = interesting.join(", ");
         for chunk in wrap_line(&joined, 70) {
             println!("      {chunk}");
         }
@@ -452,7 +474,7 @@ fn print_strings(
         println!(
             "    @0x{:<8x}  {}",
             s.offset,
-            truncate(&s.value, 90)
+            truncate(&sanitize_display_label(&s.value), 90)
         );
     }
     if filtered.len() > cap {

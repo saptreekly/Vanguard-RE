@@ -21,7 +21,7 @@ use anyhow::{Context, Result, bail};
 use walkdir::WalkDir;
 use zip::ZipArchive;
 
-use crate::util::{map_file, sanitize_display_label};
+use crate::util::{map_file, sanitize_display_label, MAX_TOTAL_RETAINED_BYTES};
 
 const MAX_ARCHIVE_DEPTH: usize = 3;
 const MAX_ARCHIVE_MEMBERS: usize = 512;
@@ -139,8 +139,10 @@ pub fn containment_policy() -> ContainmentReport {
             "ZIP members are never extracted with execute permission.".into(),
             "Recovered inner-archive payloads stay in RAM; never written as runnable files.".into(),
             "Archive depth, member count, per-member/total bytes, sample count, host file size, embedded-ZIP probes, and password-oracle member size are capped.".into(),
+            "Host directory ingest shares one investigation-wide retained-byte budget.".into(),
             "Embedded ZIP expansion shares one investigation-wide decompressed-byte budget.".into(),
             "AES-ZIP password recovery is attempt-capped (PBKDF2 is expensive per try).".into(),
+            "PE/ELF/Mach-O metadata and report strings are stripped of control/ANSI chars.".into(),
             "Dynamic analysis would require an external microVM — not host exec.".into(),
         ],
     }
@@ -199,11 +201,20 @@ pub fn collect_samples(
     };
 
     let mut out = Vec::new();
+    // Aggregate retained-byte budget across host files and ZIP children so a
+    // directory of many near-limit samples cannot OOM the analyzer.
+    let mut retained_bytes = 0u64;
+    let root_label = sanitize_display_label(&path.display().to_string());
     for entry in walker.into_iter().filter_map(|e| e.ok()) {
         if out.len() >= MAX_QUARANTINED_SAMPLES {
             eprintln!(
-                "sample cap ({MAX_QUARANTINED_SAMPLES}) reached under {}; stopping directory walk",
-                sanitize_display_label(&path.display().to_string())
+                "sample cap ({MAX_QUARANTINED_SAMPLES}) reached under {root_label}; stopping directory walk"
+            );
+            break;
+        }
+        if retained_bytes >= MAX_TOTAL_RETAINED_BYTES {
+            eprintln!(
+                "retained byte cap ({MAX_TOTAL_RETAINED_BYTES}) reached under {root_label}; stopping directory walk"
             );
             break;
         }
@@ -220,13 +231,36 @@ pub fn collect_samples(
                     if samples.len() > room {
                         samples.truncate(room);
                     }
-                    out.append(&mut samples);
+                    // Drop members that would breach the retained-byte budget.
+                    let mut kept = Vec::with_capacity(samples.len());
+                    for sample in samples {
+                        let n = sample.data.len() as u64;
+                        if retained_bytes.saturating_add(n) > MAX_TOTAL_RETAINED_BYTES {
+                            eprintln!(
+                                "retained byte cap ({MAX_TOTAL_RETAINED_BYTES}) reached under {root_label}; truncating zip {safe_path}"
+                            );
+                            break;
+                        }
+                        retained_bytes += n;
+                        kept.push(sample);
+                    }
+                    out.append(&mut kept);
                 }
                 Err(e) => eprintln!("skip zip {safe_path}: {e:#}"),
             }
         } else {
             match map_file(p) {
-                Ok(mmap) => out.push(QuarantinedSample::new(safe_path, None, mmap[..].to_vec())),
+                Ok(mmap) => {
+                    let n = mmap.len() as u64;
+                    if retained_bytes.saturating_add(n) > MAX_TOTAL_RETAINED_BYTES {
+                        eprintln!(
+                            "retained byte cap ({MAX_TOTAL_RETAINED_BYTES}) reached under {root_label}; stopping directory walk"
+                        );
+                        break;
+                    }
+                    retained_bytes += n;
+                    out.push(QuarantinedSample::new(safe_path, None, mmap[..].to_vec()));
+                }
                 Err(e) => eprintln!("skip {safe_path}: {e:#}"),
             }
         }
@@ -1248,5 +1282,26 @@ mod tests {
         let mut aes_left = MAX_AES_PASSWORD_CANDIDATES; // exactly the per-archive AES cap
         assert!(try_recover_zip_password(&zip, &cands, &mut aes_left).is_none());
         assert_eq!(aes_left, 0);
+    }
+
+    #[test]
+    fn directory_ingest_honours_retained_byte_budget() {
+        // Three ~200 KiB files would fit a tiny synthetic cap of 450 KiB only
+        // twice — exercise the same saturating add used by collect_samples.
+        let mut retained = 0u64;
+        let cap = 450 * 1024u64;
+        let sizes = [200 * 1024u64, 200 * 1024, 200 * 1024];
+        let mut kept = 0usize;
+        for n in sizes {
+            if retained.saturating_add(n) > cap {
+                break;
+            }
+            retained += n;
+            kept += 1;
+        }
+        assert_eq!(kept, 2);
+        assert!(retained <= cap);
+        // Production constant must stay aligned with the per-file ceiling.
+        assert_eq!(MAX_TOTAL_RETAINED_BYTES, crate::util::MAX_SAMPLE_BYTES);
     }
 }

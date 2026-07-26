@@ -10,6 +10,10 @@ use walkdir::WalkDir;
 
 /// Refuse to ingest a single host file larger than this (DoS / sparse-file guard).
 pub const MAX_SAMPLE_BYTES: u64 = 512 * 1024 * 1024;
+/// Cap total retained sample bytes across one investigation (host files + ZIP
+/// children + embedded extracts). Without this, a directory of many near-limit
+/// files can OOM despite the per-file cap.
+pub const MAX_TOTAL_RETAINED_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Strip C0/C1 control characters (including ESC/CSI) from analyst-facing text.
 ///
