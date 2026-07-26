@@ -6,6 +6,9 @@ use std::path::Path;
 use crate::containment::{EmbeddedArchive, QuarantinedSample};
 use crate::crypto::{CryptoFinding, XorRecovery, scan as scan_crypto, scan_pairwise_across, scan_xor};
 use crate::disasm::{DisasmReport, ExtractedString, disassemble, interesting_strings};
+use crate::dynamic::{
+    self, DynamicDive, DynamicStatus, EmulateOptions, MAX_DYNAMIC_PER_ARCHIVE, MIN_DYNAMIC_SCORE,
+};
 use crate::heuristics::{CapabilityTag, ThreatScore, capability_summary, score_imports_with_string_apis};
 use crate::iocs::{IocKind, NetworkIoc, scan_data as scan_iocs, scan_data_limited};
 use crate::secrets::{SecretCandidate, scan as scan_secrets};
@@ -46,6 +49,8 @@ pub struct DeepDive {
     /// Pre-grouped imports for the Imports tab (library → functions).
     pub grouped_imports: Vec<(String, Vec<String>)>,
     pub disasm: Option<DisasmReport>,
+    /// Speakeasy emulation (Docker `--network=none` only); `None` if not attempted.
+    pub dynamic: Option<DynamicDive>,
 }
 
 /// Hardcoded network / C2 candidates found in a sample (static strings + DNS APIs).
@@ -69,6 +74,8 @@ pub struct InvestigationReport {
     pub network_findings: Vec<NetworkFindings>,
     pub yara_by_sample: Vec<(String, Vec<YaraMatch>)>,
     pub deep_dives: Vec<DeepDive>,
+    /// Archive-level dynamic / Speakeasy status for the banner.
+    pub dynamic_status: DynamicStatus,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -601,6 +608,14 @@ pub fn investigate(
         .take(ceiling)
         .collect();
 
+    // Fort Knox dynamic: probe once; never pull images; no host-exec fallback.
+    let isolation = dynamic::isolation_status();
+    let mut dyn_ok = 0usize;
+    let mut dyn_failed = 0usize;
+    let mut dyn_skipped = 0usize;
+    let mut dyn_slots_used = 0usize;
+    let mut dynamic_attempted = false;
+
     let mut deep_dives = Vec::new();
     for r in deep_targets {
         let Some(data) = data_by_label.get(r.path.as_str()) else {
@@ -680,12 +695,41 @@ pub fn investigate(
         let secrets = scan_secrets(data);
         let grouped_imports = group_imports(&r.binary.imports);
 
+        let mut capabilities = r.threat.capabilities.clone();
+
+        // Budgeted PE Speakeasy: max 3 / archive, score ≥ 40 preferred, Docker only.
+        let dynamic_dive = if isolation.is_ready()
+            && r.binary.format == BinaryFormat::Pe
+            && r.threat.score >= MIN_DYNAMIC_SCORE
+            && dyn_slots_used < MAX_DYNAMIC_PER_ARCHIVE
+        {
+            dynamic_attempted = true;
+            dyn_slots_used += 1;
+            let dive = dynamic::emulate_pe_with_status(
+                data,
+                EmulateOptions::default(),
+                &isolation,
+            );
+            match dive.status.as_str() {
+                "ok" => dyn_ok += 1,
+                "skipped" => dyn_skipped += 1,
+                _ => dyn_failed += 1,
+            }
+            if dive.ok() {
+                dynamic::merge_capabilities(&mut capabilities, &dive.capabilities);
+                dynamic::merge_network(&mut network_iocs, &dive.network_iocs);
+            }
+            Some(dive)
+        } else {
+            None
+        };
+
         deep_dives.push(DeepDive {
             path: r.path.clone(),
             sha256: r.sha256.clone(),
             score: r.threat.score,
             reason,
-            capabilities: r.threat.capabilities.clone(),
+            capabilities,
             yara,
             interesting_strings: strings,
             network_iocs,
@@ -695,11 +739,36 @@ pub fn investigate(
             secrets,
             grouped_imports,
             disasm,
+            dynamic: dynamic_dive,
         });
     }
 
     // Pairwise keystream-reuse across sibling archive members (wave interference).
     attach_cross_sample_xor(&mut deep_dives, &triage, &data_by_label);
+
+    let dynamic_status = match &isolation {
+        dynamic::IsolationStatus::Disabled { reason } => DynamicStatus::Disabled {
+            reason: reason.clone(),
+        },
+        dynamic::IsolationStatus::Unavailable { reason } => DynamicStatus::Unavailable {
+            reason: reason.clone(),
+        },
+        dynamic::IsolationStatus::Ready { image, image_id }
+            if dynamic_attempted =>
+        {
+            DynamicStatus::Ran {
+                ok: dyn_ok,
+                failed: dyn_failed,
+                skipped: dyn_skipped,
+                image: image.clone(),
+                image_id: image_id.clone(),
+            }
+        }
+        dynamic::IsolationStatus::Ready { image, image_id } => DynamicStatus::Ready {
+            image: image.clone(),
+            image_id: image_id.clone(),
+        },
+    };
 
     Ok(InvestigationReport {
         source: source.to_string(),
@@ -710,6 +779,7 @@ pub fn investigate(
         network_findings,
         yara_by_sample,
         deep_dives,
+        dynamic_status,
     })
 }
 

@@ -8,7 +8,7 @@ High-speed, memory-safe static malware triage from the command line.
 |--------|-----|
 | **Speed** | `memmap2` zero-copy I/O + focused static pipelines |
 | **Accuracy** | Formal PE / ELF / Mach-O parsing (`goblin`), ImpHash, Shannon entropy, IAT heuristics, iced-x86 disassembly, crypto fingerprints, weak XOR recovery, network IOCs, toolchain fingerprinting |
-| **Safety** | Rust memory safety + in-memory quarantine — samples are never executed |
+| **Safety** | Rust memory safety + in-memory quarantine — samples are never executed on the host OS; optional Speakeasy emulation stages ephemeral non-executable bytes under `$TMPDIR` and runs only inside Docker `--network=none` |
 
 ## Architecture
 
@@ -19,10 +19,12 @@ High-speed, memory-safe static malware triage from the command line.
                          │
     ┌──────────┬─────────┼─────────┬──────────┐
     ▼          ▼         ▼         ▼          ▼
- Static    Disasm +   Signatures  Network   Crypto
- Triage    Code       (hashes /   IOC       Constants
-           Analysis   builtins)   Extractor Fingerprints
+ Static    Disasm +   Signatures  Network   Crypto     Dynamic*
+ Triage    Code       (hashes /   IOC       Constants  (Speakeasy
+           Analysis   builtins)   Extractor Fingerprints in Docker)
 ```
+
+\*Dynamic is optional and fail-closed: if Docker / the Speakeasy image is missing, the report continues static-only.
 
 ## What it extracts
 
@@ -40,6 +42,7 @@ High-speed, memory-safe static malware triage from the command line.
 | **Strings** | Ranked ASCII + UTF-16LE extraction (not first-N file order), ransomware / C2 keyword filter, import DLLs |
 | **Disassembly** | iced-x86 function recovery, interest ranking, k-means clusters, technique insights |
 | **Code analysis** | Automated technique flags: PEB access, API hashing, XOR loops, stack strings, direct syscalls, indirect dispatch |
+| **Dynamic (optional)** | Mandiant Speakeasy (Unicorn) inside Docker `--network=none` for up to **3** PE deep-dives (score ≥ 40, 45s each). Adds `dynamic:` evidence to caps / network IOCs (`dyn:` prefix). Never host-exec; no dropped files leave the container |
 
 ## Scoring & ranking
 
@@ -80,14 +83,45 @@ Additional ranking rules:
 cargo check
 
 # Rebuild release + install onto PATH (~/.local/bin)
+# Also builds the Speakeasy Docker image when Docker is available
 ./install.sh
+
+# Binary only (skip Docker image):
+VANGUARD_SKIP_DOCKER=1 ./install.sh
 
 # Or manually:
 cargo build --release
 cp target/release/vanguard ~/.local/bin/vanguard
+docker build -t vanguard-speakeasy:latest ./docker/speakeasy
 ```
 
 Builtin signature rules are a lightweight string/byte matcher. External `.yar` files are currently ignored with a note.
+
+### Dynamic (optional): Speakeasy in Docker
+
+Emulation is **not** sandbox detonation. Network is doubly blocked (Speakeasy fake net + Docker `--network=none`). Staging files are mode `0400`, never `+x`, wiped for their **full length** on Drop, and stale `$TMPDIR/vanguard-dyn-<pid>-<suffix>` trees are reaped on the next isolation probe. A hard kill (`SIGKILL`) of `vanguard` can skip Drop — leftover staging is owner-only (`0700`/`0400`) until the next run.
+
+```bash
+# Build the Speakeasy image (required once for dynamic; rebuild after entrypoint changes)
+docker build -t vanguard-speakeasy:latest ./docker/speakeasy
+
+# Record the local image id (shown in the CLI dynamic banner when ready)
+docker image inspect --format '{{.Id}}' vanguard-speakeasy:latest
+
+# Then the default command automatically emulates top PE deep-dives offline
+vanguard sample.zip
+```
+
+The image runs Speakeasy with `all_entrypoints=True` (and `emulate_children`) so DLL exports are exercised — DllMain alone is often a no-op. The entrypoint applies a generic **lab Windows** profile (Win7-ish identity, `rundll32` host process, Explorer/services inventory, USB + Winlogon/MSNetMng registry seeds, decoy USB files, `modules_always_exist`) plus **API gap fillers with correct `argc`** for Speakeasy 1.5.x holes that abort entry points (notably `RegCreateKeyEx` / `RegSetValueEx`, resource-update APIs, ACL helpers). Remaining `unsupported_api` aborts surface in the report as `gap`. This is still an emulator fiction — useful for unlocking gated paths, not proof of real-world execution. The host mapper only trusts `entry_points[].apis[]` / `events[]` (plus entry-point errors) — Speakeasy’s static `strings` tables are ignored so they cannot fake dynamic caps.
+
+| Env | Meaning |
+|-----|---------|
+| `VANGUARD_DYNAMIC=0` | Force-off dynamic (static-only) |
+| `VANGUARD_SPEAKEASY_IMAGE=…` | Override image ref (default `vanguard-speakeasy:latest`). Prefer a digest pin: `vanguard-speakeasy@sha256:…` |
+
+Pin / rebuild: Speakeasy **package** version is pinned in `docker/speakeasy/Dockerfile` (`speakeasy-emulator==…`). Rebuild after intentional upgrades. `./install.sh` prints the resolved image id after build. The CLI banner shows a short image id when isolation is ready so tag swap is visible.
+
+**Leak checks (Fort Knox):** while emulating a sample that calls `InternetOpenUrl`, host `tcpdump`/firewall must see **zero** outbound from the container; `docker ps` must be clean after timeout kill; staging path must be gone after the run.
 
 ## Usage
 
@@ -134,17 +168,26 @@ When weak XOR is recovered on a deep-dive, the sample block includes a named sch
       note   IC L=1 (0.065); 94% printable
 ```
 
-Passworded malware packs and ZIPs embedded inside binaries are decrypted into RAM only, then ranked, signature-scanned, and deep-dived — nothing is executed.
+Passworded malware packs and ZIPs embedded inside binaries are decrypted into RAM only, then ranked, signature-scanned, and deep-dived — nothing is executed on the host OS.
 
 ## Containment
 
-- **Static-only** — nothing is executed on the host
+Two layers (see `containment_policy()`):
+
+**Static quarantine (in-memory)**
+- **No host exec** — sample bytes never run under the host OS loader
 - Top-level and embedded ZIP members stay in process memory; never written as runnable files
-- Recovered inner payloads (e.g. decrypted WannaCry `.wnry` files) are analyzed in RAM only, never dropped to disk as runnable files
+- Recovered inner payloads (e.g. decrypted WannaCry `.wnry` files) are analyzed in RAM only
 - Archive depth, member count, per-member/total bytes, central-directory scans, embedded-ZIP carves, and total sample count are capped; host files over 512 MiB are refused
 - ZIP member reads are hard-bounded on actual decompression (not just declared sizes) to blunt zip bombs
 - Path traversal / absolute / drive-style ZIP names are rejected; corpus walks do not follow symlinks
-- Dynamic analysis (if added later) would use a real microVM, not host exec
+
+**Dynamic staging (ephemeral, optional)**
+- Speakeasy may write `sample.bin` under `$TMPDIR/vanguard-dyn-<pid>-<suffix>/` (dir `0700`, file `0400`, never `+x`)
+- Container flags include `--network=none`, `--cap-drop=ALL`, `no-new-privileges`, `--read-only`, `--ipc=private`, memory/CPU/pids/`nproc` limits, user `65534`, and a host wall-clock timeout (guest `VANGUARD_EMU_TIMEOUT` is set from Rust). UTS stays on Docker’s default private namespace (there is no valid `--uts=private` flag)
+- Staging is wiped for its full length then unlinked on Drop; stale staging dirs matching the pid/suffix pattern are reaped on isolation probe
+- Emulator drops never leave the container. If Docker/image is missing, dynamic is skipped (static-only)
+- Trust the image: prefer `VANGUARD_SPEAKEASY_IMAGE=…@sha256:…`; the banner shows the resolved local image id
 
 ## License
 

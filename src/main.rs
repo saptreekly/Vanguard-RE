@@ -14,7 +14,9 @@ use vanguard_re::investigate::{InvestigateOptions, investigate};
     name = "vanguard",
     about = "High-speed, memory-safe static malware triage",
     long_about = "Map and statically analyze a sample or passworded ZIP. \
-Nothing is executed; ZIP members stay in process memory only."
+Sample bytes are never executed on the host OS; ZIP members stay in process \
+memory. Optional Speakeasy emulation (if Docker is ready) stages a non-executable \
+copy under TMPDIR inside Docker --network=none only."
 )]
 struct Args {
     /// Path to a sample file or ZIP archive

@@ -209,7 +209,9 @@ fn scan_urls(text: &str, found: &mut BTreeMap<String, NetworkIoc>) {
             let (confidence, private) = if let Some(octets) = parse_ipv4(host_only) {
                 let private = is_private(octets);
                 (if private { 40 } else { 95 }, private)
-            } else if looks_like_ipv6(host_only.trim_matches(['[', ']'])) {
+            } else if looks_like_ipv6(host_only.trim_matches(['[', ']']))
+                && !is_junk_ipv6(host_only.trim_matches(['[', ']']))
+            {
                 let private = is_private_ipv6(host_only.trim_matches(['[', ']']));
                 (if private { 40 } else { 95 }, private)
             } else {
@@ -318,6 +320,61 @@ fn is_private_ipv6(s: &str) -> bool {
         || lower.starts_with("::ffff:") // IPv4-mapped — treat conservatively
 }
 
+/// Reject binary-noise IPv6 lookalikes (fill patterns, tiny compressed scraps).
+///
+/// GreenBug-style blobs often yield `e::e`, `e::badb`, `2020:2020:2020:…:2222`.
+pub fn is_junk_ipv6(s: &str) -> bool {
+    let s = s
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    if s.is_empty() || !s.contains(':') {
+        return true;
+    }
+
+    // Embedded IPv4 mapped forms are handled elsewhere; don't junk-filter them here.
+    if s.contains('.') {
+        return false;
+    }
+
+    let hex_digits = s.chars().filter(|c| c.is_ascii_hexdigit()).count();
+    let hextets: Vec<&str> = s.split(':').filter(|p| !p.is_empty()).collect();
+
+    // Tiny compressed leftovers: e::e, e::fa, e::badb, a::1
+    if s.contains("::") && hex_digits < 6 {
+        return true;
+    }
+
+    // Repeating fill hextets: 2020:2020:2020:2020:2020:2020:2020:2222
+    if hextets.len() >= 4 {
+        let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+        for h in &hextets {
+            *counts.entry(*h).or_default() += 1;
+        }
+        if counts.values().any(|&n| n >= 4) {
+            return true;
+        }
+        // Almost-homogeneous full addresses (≤2 distinct hextets across ≥6 groups)
+        if hextets.len() >= 6 && counts.len() <= 2 {
+            return true;
+        }
+    }
+
+    // Sparse uncompressed: mostly zeros / single-nibble groups, no real structure
+    if !s.contains("::") && hextets.len() == 8 {
+        let nontrivial = hextets
+            .iter()
+            .filter(|h| h.len() >= 3 && **h != "0000" && **h != "0")
+            .count();
+        if nontrivial <= 1 {
+            return true;
+        }
+    }
+
+    false
+}
+
 /// Scan free text for IPv6 literals, including `[addr]:port`.
 fn scan_ipv6(text: &str, found: &mut BTreeMap<String, NetworkIoc>) {
     let b = text.as_bytes();
@@ -328,7 +385,7 @@ fn scan_ipv6(text: &str, found: &mut BTreeMap<String, NetworkIoc>) {
             if let Some(rel_end) = text[i + 1..].find(']') {
                 let addr = &text[i + 1..i + 1 + rel_end];
                 let after = i + 1 + rel_end + 1;
-                if looks_like_ipv6(addr) {
+                if looks_like_ipv6(addr) && !is_junk_ipv6(addr) {
                     let private = is_private_ipv6(addr);
                     let mut end = after;
                     let mut kind = IocKind::Ipv6;
@@ -393,8 +450,8 @@ fn scan_ipv6(text: &str, found: &mut BTreeMap<String, NetworkIoc>) {
         let candidate = &text[start..j];
         if looks_like_ipv6(candidate) {
             let private = is_private_ipv6(candidate);
-            // Bare private/link-local without brackets is usually noise.
-            if !private {
+            // Bare private/link-local / binary-noise IPv6 is usually not a C2 IOC.
+            if !private && !is_junk_ipv6(candidate) {
                 add(
                     found,
                     NetworkIoc {
@@ -1076,5 +1133,30 @@ mod tests {
         assert!(looks_like_ipv6("::ffff:192.0.2.1"));
         assert!(!looks_like_ipv6("185.220.101.5:443"));
         assert!(!looks_like_ipv6("not:an:ip:address:here:too:many:groups:extra"));
+    }
+
+    #[test]
+    fn rejects_junk_ipv6_noise() {
+        assert!(is_junk_ipv6("e::e"));
+        assert!(is_junk_ipv6("e::fa"));
+        assert!(is_junk_ipv6("e::badb"));
+        assert!(is_junk_ipv6("2020:2020:2020:2020:2020:2020:2020:2222"));
+        assert!(!is_junk_ipv6("2001:db8::1"));
+        assert!(!is_junk_ipv6("2001:db8:85a3::8a2e:370:7334"));
+
+        let data = b"noise e::e e::badb 2020:2020:2020:2020:2020:2020:2020:2222 and real 2001:db8::1";
+        let iocs = scan_data(data);
+        assert!(
+            iocs.iter().all(|i| {
+                i.kind != IocKind::Ipv6
+                    || (!i.value.contains("e::") && !i.value.starts_with("2020:2020"))
+            }),
+            "junk IPv6 leaked: {iocs:?}"
+        );
+        assert!(
+            iocs.iter()
+                .any(|i| i.kind == IocKind::Ipv6 && i.value == "2001:db8::1"),
+            "real IPv6 dropped: {iocs:?}"
+        );
     }
 }

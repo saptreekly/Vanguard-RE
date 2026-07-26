@@ -1,17 +1,20 @@
-//! Containment: ingest archives and samples without ever executing them.
+//! Containment: ingest archives and samples without ever executing them on the host.
 //!
 //! # Safety model
 //!
-//! Vanguard-RE is **static-only**. It never `exec`s, `spawn`s, or maps sample
-//! pages as executable. Passworded ZIP members are decrypted **into RAM** and
-//! parsed from byte slices — they are not written to disk as runnable files.
+//! **Static quarantine** never `exec`s, `spawn`s, or maps sample pages as
+//! executable. Passworded ZIP members are decrypted **into RAM** and parsed
+//! from byte slices — they are not written to disk as runnable files.
+//!
+//! **Optional dynamic analysis** (Speakeasy) may stage ephemeral, non-executable
+//! sample bytes under `$TMPDIR` and emulate them only inside Docker with
+//! `--network=none`. That staging path is separate from static quarantine; see
+//! [`containment_policy`] and `crate::dynamic`.
 //!
 //! A custom “lightweight hypervisor” is intentionally **not** part of this
-//! path: building a trustworthy HV is a multi-year systems project, and for
-//! static triage it buys nothing over in-memory parsing. If dynamic analysis
-//! is added later, isolate it with a battle-tested microVM (Apple
-//! Virtualization.framework, Firecracker, or QEMU), never by running the
-//! sample on the host.
+//! path: building a trustworthy HV is a multi-year systems project. Deeper
+//! isolation (Apple Virtualization.framework, Firecracker, QEMU) is future
+//! work — never host-exec of sample bytes.
 
 use std::fs::File;
 use std::io::{Cursor, Read, Seek};
@@ -42,7 +45,8 @@ pub struct QuarantinedSample {
     pub label: String,
     /// Origin archive, if extracted from one.
     pub archive: Option<String>,
-    /// Raw file bytes — never marked executable; never written to disk here.
+    /// Raw file bytes — never marked executable. Static paths keep these in RAM;
+    /// optional Speakeasy may stage a non-executable copy under `$TMPDIR`.
     pub data: Vec<u8>,
     /// ZIP archives carved out of this sample's own bytes (overlay / resource
     /// section). Recorded even when members cannot be decrypted, because the
@@ -100,26 +104,43 @@ pub struct EmbeddedMember {
     pub encrypted: bool,
 }
 
+/// How sample bytes may touch the host filesystem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SampleWriteMode {
+    /// Static quarantine only — samples never leave process memory as files.
+    InMemoryOnly,
+    /// Product may stage ephemeral non-executable files under `$TMPDIR` for Docker Speakeasy.
+    EphemeralStaging,
+}
+
 #[derive(Debug, Clone)]
 pub struct ContainmentReport {
+    /// Short policy label (static quarantine + optional staging).
     pub mode: &'static str,
+    /// Always false: host OS loader never runs sample bytes.
     pub executes_samples: bool,
+    /// True when the product may write sample bytes (ephemeral Speakeasy staging).
+    /// Static ZIP extract still never writes runnable files.
     pub writes_samples_to_disk: bool,
+    pub sample_write_mode: SampleWriteMode,
     pub notes: Vec<String>,
 }
 
 pub fn containment_policy() -> ContainmentReport {
     ContainmentReport {
-        mode: "static-in-memory",
+        mode: "in-memory-quarantine+ephemeral-staging",
         executes_samples: false,
-        writes_samples_to_disk: false,
+        // Honest: Speakeasy stages sample.bin under TMPDIR (0400, wiped on Drop).
+        writes_samples_to_disk: true,
+        sample_write_mode: SampleWriteMode::EphemeralStaging,
         notes: vec![
-            "Samples are memory-mapped or decrypted into RAM only.".into(),
-            "No process spawn / CreateProcess / execve of sample bytes.".into(),
+            "Static quarantine: samples are memory-mapped or decrypted into RAM only.".into(),
+            "No process spawn / CreateProcess / execve of sample bytes on the host OS.".into(),
             "ZIP members are never extracted with execute permission.".into(),
             "Recovered inner-archive payloads stay in RAM; never written as runnable files.".into(),
             "Archive depth, member count, per-member/total bytes, sample count, and host file size are capped.".into(),
-            "Dynamic analysis would require an external microVM — not host exec.".into(),
+            "Dynamic staging: Speakeasy may write ephemeral non-executable sample.bin under $TMPDIR (mode 0400), bind-mount read-only into Docker `--network=none`, then wipe+unlink (best-effort; SIGKILL can leave leftovers — reaped on next probe).".into(),
+            "If Docker or the Speakeasy image is unavailable, dynamic analysis is skipped and static triage continues.".into(),
         ],
     }
 }
@@ -765,10 +786,13 @@ mod tests {
     use zip::write::SimpleFileOptions;
 
     #[test]
-    fn policy_never_executes() {
+    fn policy_never_executes_but_may_stage() {
         let p = containment_policy();
         assert!(!p.executes_samples);
-        assert!(!p.writes_samples_to_disk);
+        assert!(p.writes_samples_to_disk);
+        assert_eq!(p.sample_write_mode, SampleWriteMode::EphemeralStaging);
+        assert!(p.notes.iter().any(|n| n.contains("Dynamic staging")));
+        assert!(p.notes.iter().any(|n| n.contains("Static quarantine")));
     }
 
     fn test_zip(member: &str, contents: &[u8]) -> Vec<u8> {
