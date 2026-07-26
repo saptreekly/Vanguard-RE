@@ -4,8 +4,14 @@ use std::path::Path;
 
 use super::entropy::{SectionEntropy, entropy_heatmap, section_entropy};
 use super::report::SectionInfo;
+use crate::util::sanitize_display_label;
 use anyhow::{Context, Result, bail};
 use goblin::Object;
+
+/// Bound attacker-controlled header tables when materializing triage structs.
+const MAX_SECTIONS: usize = 512;
+const MAX_IMPORTS: usize = 8_192;
+const MAX_EXPORTS: usize = 8_192;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BinaryFormat {
@@ -323,9 +329,13 @@ fn looks_mostly_text(data: &[u8]) -> bool {
         return true;
     }
     // Config blobs with a binary header + ASCII body (WannaCry c.wnry).
-    if data.windows(6).any(|w| w.eq_ignore_ascii_case(b".onion"))
-        || data.windows(7).any(|w| w.eq_ignore_ascii_case(b"http://"))
-        || data.windows(8).any(|w| w.eq_ignore_ascii_case(b"https://"))
+    // Bound the probe — full-sample `.onion`/`http` window scans on a 512 MiB
+    // raw blob are a cheap malware-triggered CPU DoS during triage.
+    const TEXT_PROBE: usize = 64 * 1024;
+    let probe = &data[..data.len().min(TEXT_PROBE)];
+    if probe.windows(6).any(|w| w.eq_ignore_ascii_case(b".onion"))
+        || probe.windows(7).any(|w| w.eq_ignore_ascii_case(b"http://"))
+        || probe.windows(8).any(|w| w.eq_ignore_ascii_case(b"https://"))
     {
         return true;
     }
@@ -441,9 +451,13 @@ fn parse_pe(data: &[u8], pe: goblin::pe::PE<'_>, with_map: bool) -> Result<Parse
     let mut entropy_maps = Vec::new();
 
     for sec in &pe.sections {
-        let name = String::from_utf8_lossy(&sec.name)
-            .trim_end_matches('\0')
-            .to_string();
+        if sections.len() >= MAX_SECTIONS {
+            break;
+        }
+        let name = sanitize_display_label(
+            String::from_utf8_lossy(&sec.name)
+                .trim_end_matches('\0'),
+        );
         let start = sec.pointer_to_raw_data as usize;
         let size = sec.size_of_raw_data as usize;
         let slice = data.get(start..start.saturating_add(size)).unwrap_or(&[]);
@@ -466,16 +480,20 @@ fn parse_pe(data: &[u8], pe: goblin::pe::PE<'_>, with_map: bool) -> Result<Parse
 
     let mut imports = Vec::new();
     for import in &pe.imports {
+        if imports.len() >= MAX_IMPORTS {
+            break;
+        }
         imports.push(ImportEntry {
-            library: import.dll.to_string(),
-            function: import.name.to_string(),
+            library: sanitize_display_label(import.dll),
+            function: sanitize_display_label(&import.name),
         });
     }
 
     let exports: Vec<String> = pe
         .exports
         .iter()
-        .filter_map(|e| e.name.map(|n| n.to_string()))
+        .filter_map(|e| e.name.map(sanitize_display_label))
+        .take(MAX_EXPORTS)
         .collect();
 
     let compile_timestamp = pe.header.coff_header.time_date_stamp.pipe_nonzero();
@@ -575,11 +593,12 @@ fn parse_elf(data: &[u8], elf: goblin::elf::Elf<'_>, with_map: bool) -> Result<P
     let mut entropy_maps = Vec::new();
 
     for sec in &elf.section_headers {
-        let name = elf
-            .shdr_strtab
-            .get_at(sec.sh_name)
-            .unwrap_or("")
-            .to_string();
+        if sections.len() >= MAX_SECTIONS {
+            break;
+        }
+        let name = sanitize_display_label(
+            elf.shdr_strtab.get_at(sec.sh_name).unwrap_or(""),
+        );
         if name.is_empty() {
             continue;
         }
@@ -605,20 +624,26 @@ fn parse_elf(data: &[u8], elf: goblin::elf::Elf<'_>, with_map: bool) -> Result<P
 
     let mut imports = Vec::new();
     for lib in &elf.libraries {
+        if imports.len() >= MAX_IMPORTS {
+            break;
+        }
         // ELF dynamic imports are symbol-level; record library with placeholder
         imports.push(ImportEntry {
-            library: (*lib).to_string(),
+            library: sanitize_display_label(lib),
             function: "*".into(),
         });
     }
     let version_libs = elf_version_lib_map(&elf);
     for (sym_idx, sym) in elf.dynsyms.iter().enumerate() {
+        if imports.len() >= MAX_IMPORTS {
+            break;
+        }
         if sym.is_import() {
             if let Some(name) = elf.dynstrtab.get_at(sym.st_name) {
                 let lib = elf_import_library(&elf, &version_libs, sym_idx);
                 imports.push(ImportEntry {
-                    library: lib,
-                    function: name.to_string(),
+                    library: sanitize_display_label(&lib),
+                    function: sanitize_display_label(name),
                 });
             }
         }
@@ -628,13 +653,18 @@ fn parse_elf(data: &[u8], elf: goblin::elf::Elf<'_>, with_map: bool) -> Result<P
         .dynsyms
         .iter()
         .filter(|s| s.st_bind() == goblin::elf::sym::STB_GLOBAL && !s.is_import())
-        .filter_map(|s| elf.dynstrtab.get_at(s.st_name).map(|n| n.to_string()))
+        .filter_map(|s| {
+            elf.dynstrtab
+                .get_at(s.st_name)
+                .map(sanitize_display_label)
+        })
+        .take(MAX_EXPORTS)
         .collect();
 
     let symbols: Vec<String> = elf
         .syms
         .iter()
-        .filter_map(|s| elf.strtab.get_at(s.st_name).map(|n| n.to_string()))
+        .filter_map(|s| elf.strtab.get_at(s.st_name).map(sanitize_display_label))
         .filter(|n| !n.is_empty())
         .take(500)
         .collect();
@@ -794,8 +824,11 @@ fn parse_macho(
 
     let segments = macho.segments.sections().flatten();
     for section_result in segments {
+        if sections.len() >= MAX_SECTIONS {
+            break;
+        }
         let (section, _data_opt) = section_result?;
-        let name = section.name().unwrap_or("").to_string();
+        let name = sanitize_display_label(section.name().unwrap_or(""));
         let start = section.offset as usize;
         let size = section.size as usize;
         let slice = data.get(start..start.saturating_add(size)).unwrap_or(&[]);
@@ -819,9 +852,12 @@ fn parse_macho(
     let mut imports = Vec::new();
     if let Ok(imports_map) = macho.imports() {
         for imp in imports_map.iter() {
+            if imports.len() >= MAX_IMPORTS {
+                break;
+            }
             imports.push(ImportEntry {
-                library: imp.dylib.to_string(),
-                function: imp.name.to_string(),
+                library: sanitize_display_label(imp.dylib),
+                function: sanitize_display_label(imp.name),
             });
         }
     }
@@ -829,7 +865,12 @@ fn parse_macho(
     let exports: Vec<String> = macho
         .exports()
         .ok()
-        .map(|exps| exps.iter().map(|e| e.name.to_string()).collect())
+        .map(|exps| {
+            exps.iter()
+                .map(|e| sanitize_display_label(&e.name))
+                .take(MAX_EXPORTS)
+                .collect()
+        })
         .unwrap_or_default();
 
     let symbols: Vec<String> = macho
@@ -838,7 +879,7 @@ fn parse_macho(
         .map(|syms| {
             syms.iter()
                 .filter_map(|s| s.ok())
-                .map(|(name, _)| name.to_string())
+                .map(|(name, _)| sanitize_display_label(name))
                 .take(500)
                 .collect()
         })
@@ -930,6 +971,20 @@ mod tests {
     #[test]
     fn formats_macho_packed_version() {
         assert_eq!(format_macho_version(0x000d_0201), "13.2.1");
+    }
+
+    #[test]
+    fn metadata_sanitize_strips_ansi_from_names() {
+        // Contract for PE/ELF/Mach-O parse paths: attacker-controlled section /
+        // import / export / symbol names must lose ESC/C0 before triage storage.
+        assert_eq!(
+            sanitize_display_label(".\x1b[31mtext\0"),
+            ".[31mtext"
+        );
+        assert_eq!(
+            sanitize_display_label("kernel32\x07.dll"),
+            "kernel32.dll"
+        );
     }
 
     #[test]

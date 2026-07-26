@@ -10,6 +10,31 @@ use walkdir::WalkDir;
 
 /// Refuse to ingest a single host file larger than this (DoS / sparse-file guard).
 pub const MAX_SAMPLE_BYTES: u64 = 512 * 1024 * 1024;
+/// Cap total retained sample bytes across one investigation (host files + ZIP
+/// children + embedded extracts). Without this, a directory of many near-limit
+/// files can OOM despite the per-file cap.
+pub const MAX_TOTAL_RETAINED_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Strip C0/C1 control characters (including ESC/CSI) from analyst-facing text.
+///
+/// Malware-controlled filesystem names and ZIP labels must not be able to
+/// hijack terminal output via ANSI / OSC escape sequences.
+pub fn sanitize_display_label(s: &str) -> String {
+    s.chars()
+        .filter(|c| *c != '\0' && !c.is_control())
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_strips_ansi_and_nul() {
+        assert_eq!(sanitize_display_label("a\x1b[31mb\0c"), "a[31mbc");
+        assert_eq!(sanitize_display_label("/tmp/\u{07}evil"), "/tmp/evil");
+    }
+}
 
 /// Memory-map a file for zero-copy analysis.
 pub fn map_file(path: &Path) -> Result<Mmap> {

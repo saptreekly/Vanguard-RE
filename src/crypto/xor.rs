@@ -82,6 +82,10 @@ pub struct XorRecovery {
 
 const MIN_CANDIDATE: usize = 32;
 const MAX_CANDIDATE: usize = 256 * 1024;
+/// Cap the bytes fed to key-search IC scoring. Entropy gating still uses
+/// `MAX_CANDIDATE`, but brute-forcing 256 key bytes × key lengths over a full
+/// 256 KiB window × several candidates is a CPU DoS malware can trigger.
+const MAX_RECOVER_BYTES: usize = 64 * 1024;
 const MAX_CANDIDATES_PER_SAMPLE: usize = 8;
 const MAX_PAIRS: usize = 8;
 const KEY_LENGTHS: &[usize] = &[1, 2, 3, 4, 5, 6, 8, 12, 16];
@@ -136,7 +140,9 @@ pub fn collect_candidates(data: &[u8], binary: &ParsedBinary) -> Vec<XorCandidat
                 if start >= data.len() || len == 0 {
                     continue;
                 }
-                let end = (start + len).min(data.len());
+                // Attacker-controlled section sizes can wrap `start + len` on
+                // 32-bit or panic on overflow in debug; always saturate.
+                let end = start.saturating_add(len).min(data.len());
                 let slice = &data[start..end];
                 maybe_push_window(&mut out, &sec.name, start, slice);
             }
@@ -312,6 +318,9 @@ fn dedupe_findings(findings: &mut Vec<XorRecovery>) {
 /// Guess repeating key length via IC shortlist, then pick the length whose
 /// decrypt scores best (prefers shorter keys when multiples tie on IC).
 pub fn recover_repeating(data: &[u8], offset: usize) -> Option<XorRecovery> {
+    // Key-byte search is O(key_len × 256 × n); keep the recovery window small
+    // even when candidate collection retained a larger entropy-scored slice.
+    let data = &data[..data.len().min(MAX_RECOVER_BYTES)];
     if data.len() < MIN_CANDIDATE {
         return None;
     }
@@ -611,7 +620,7 @@ pub fn recover_key_reuse(
     label1: &str,
     label2: &str,
 ) -> Option<XorRecovery> {
-    let n = c1.len().min(c2.len());
+    let n = c1.len().min(c2.len()).min(MAX_RECOVER_BYTES);
     if n < MIN_CANDIDATE {
         return None;
     }

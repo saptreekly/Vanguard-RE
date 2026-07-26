@@ -134,8 +134,16 @@ Passworded malware packs and ZIPs embedded inside binaries are decrypted into RA
 - Top-level and embedded ZIP members stay in process memory; never written as runnable files
 - Recovered inner payloads (e.g. decrypted WannaCry `.wnry` files) are analyzed in RAM only, never dropped to disk as runnable files
 - Archive depth, member count, per-member/total bytes, central-directory scans, embedded-ZIP carves, and total sample count are capped; host files over 512 MiB are refused
+- Directory / corpus ingest shares one investigation-wide retained-byte budget (512 MiB) so many near-limit files cannot OOM the analyzer
 - ZIP member reads are hard-bounded on actual decompression (not just declared sizes) to blunt zip bombs
-- Path traversal / absolute / drive-style ZIP names are rejected; corpus walks do not follow symlinks
+- Embedded ZIP carving bounds local-header probes and EOCD look-ahead so dense `PK` noise cannot quadratic-DoS the scanner
+- Credential recovery only probes encrypted members ≤64 KiB declared size, so a tiny stream with a huge declared size cannot burn decrypt+CRC work across thousands of password candidates
+- Embedded ZIP expansion shares one investigation-wide decompressed-byte budget (not a fresh 512 MiB per carved archive)
+- AES-ZIP password recovery is attempt-capped so PBKDF2 cannot be turned into a CPU bomb
+- Builtin signature / text-classification / toolchain-marker probes run over capped windows (single-pass multi-needle for toolchain markers)
+- String extraction caps candidate count and per-string length while scanning; `--disasm-count` is hard-capped at 100k
+- PE/ELF/Mach-O section / import / export tables are truncated when materializing triage structs
+- Path traversal / absolute / drive-style ZIP names are rejected; control characters are stripped from filesystem paths, ZIP labels, PE/ELF/Mach-O metadata, and report strings; corpus walks do not follow symlinks
 - Dynamic analysis (if added later) would use a real microVM, not host exec
 
 ## License

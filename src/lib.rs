@@ -21,5 +21,6 @@ pub mod util;
 pub use containment::{
     collect_samples, containment_policy, EmbeddedArchive, EmbeddedMember, QuarantinedSample,
 };
+pub use util::sanitize_display_label;
 pub use investigate::{investigate, short_name, InvestigateOptions, InvestigationReport};
 pub use triage::{BinaryFormat, TriageReport};

@@ -21,7 +21,7 @@ use anyhow::{Context, Result, bail};
 use walkdir::WalkDir;
 use zip::ZipArchive;
 
-use crate::util::map_file;
+use crate::util::{map_file, sanitize_display_label, MAX_TOTAL_RETAINED_BYTES};
 
 const MAX_ARCHIVE_DEPTH: usize = 3;
 const MAX_ARCHIVE_MEMBERS: usize = 512;
@@ -32,8 +32,28 @@ const MAX_MEMBER_SIZE: u64 = 128 * 1024 * 1024;
 const MAX_TOTAL_EXTRACTED: u64 = 512 * 1024 * 1024;
 /// Cap carved embedded ZIPs per sample to bound carve/parse work.
 const MAX_EMBEDDED_ZIPS: usize = 32;
+/// Cap total local-header probes when carving. Dense `PK\x03\x04` noise without
+/// a matching EOCD is a classic quadratic DoS against naïve scanners.
+const MAX_EMBEDDED_LOCAL_PROBES: usize = 2_048;
+/// Cap how far past a local-file header we will scan for an EOCD.
+const MAX_EOCD_SEARCH: usize = 4 * 1024 * 1024;
+/// Abort carving after this many consecutive LOCAL hits that fail header
+/// validation or EOCD matching — dense PK noise fails repeatedly; real
+/// embedded archives usually succeed within a few probes.
+const MAX_CONSECUTIVE_FAILED_PROBES: usize = 64;
 /// Cap total quarantined samples retained for one investigation.
 const MAX_QUARANTINED_SAMPLES: usize = 2_048;
+/// Max uncompressed size of the member used as a password oracle.
+/// Without this, malware can advertise a tiny compressed stream with a
+/// 128 MiB declared size and force up to `MAX_PASSWORD_CANDIDATES` full
+/// decrypt+CRC passes during credential recovery.
+const MAX_PASSWORD_PROBE_BYTES: u64 = 64 * 1024;
+/// AES-ZIP password checks run PBKDF2-HMAC-SHA1 (1000 iterations) per try.
+/// Keep the AES oracle tiny so malware cannot turn recovery into a CPU bomb.
+const MAX_AES_PASSWORD_CANDIDATES: usize = 64;
+/// Hard ceiling on AES password trials across one investigation's embedded
+/// carve/recovery pass (all embedded archives combined).
+const MAX_AES_PASSWORD_ATTEMPTS: usize = 256;
 
 /// A sample ready for static analysis. Bytes live in process memory only.
 #[derive(Debug, Clone)]
@@ -118,7 +138,11 @@ pub fn containment_policy() -> ContainmentReport {
             "No process spawn / CreateProcess / execve of sample bytes.".into(),
             "ZIP members are never extracted with execute permission.".into(),
             "Recovered inner-archive payloads stay in RAM; never written as runnable files.".into(),
-            "Archive depth, member count, per-member/total bytes, sample count, and host file size are capped.".into(),
+            "Archive depth, member count, per-member/total bytes, sample count, host file size, embedded-ZIP probes, and password-oracle member size are capped.".into(),
+            "Host directory ingest shares one investigation-wide retained-byte budget.".into(),
+            "Embedded ZIP expansion shares one investigation-wide decompressed-byte budget.".into(),
+            "AES-ZIP password recovery is attempt-capped (PBKDF2 is expensive per try).".into(),
+            "PE/ELF/Mach-O metadata and report strings are stripped of control/ANSI chars.".into(),
             "Dynamic analysis would require an external microVM — not host exec.".into(),
         ],
     }
@@ -155,7 +179,7 @@ pub fn collect_samples(
         }
         let mmap = map_file(path)?;
         let samples = vec![QuarantinedSample::new(
-            path.display().to_string(),
+            sanitize_display_label(&path.display().to_string()),
             None,
             mmap[..].to_vec(),
         )];
@@ -163,7 +187,10 @@ pub fn collect_samples(
     }
 
     if !path.is_dir() {
-        bail!("{} is not a file or directory", path.display());
+        bail!(
+            "{} is not a file or directory",
+            sanitize_display_label(&path.display().to_string())
+        );
     }
 
     // Never follow directory symlinks into unrelated trees (malicious corpora).
@@ -174,11 +201,20 @@ pub fn collect_samples(
     };
 
     let mut out = Vec::new();
+    // Aggregate retained-byte budget across host files and ZIP children so a
+    // directory of many near-limit samples cannot OOM the analyzer.
+    let mut retained_bytes = 0u64;
+    let root_label = sanitize_display_label(&path.display().to_string());
     for entry in walker.into_iter().filter_map(|e| e.ok()) {
         if out.len() >= MAX_QUARANTINED_SAMPLES {
             eprintln!(
-                "sample cap ({MAX_QUARANTINED_SAMPLES}) reached under {}; stopping directory walk",
-                path.display()
+                "sample cap ({MAX_QUARANTINED_SAMPLES}) reached under {root_label}; stopping directory walk"
+            );
+            break;
+        }
+        if retained_bytes >= MAX_TOTAL_RETAINED_BYTES {
+            eprintln!(
+                "retained byte cap ({MAX_TOTAL_RETAINED_BYTES}) reached under {root_label}; stopping directory walk"
             );
             break;
         }
@@ -187,6 +223,7 @@ pub fn collect_samples(
             continue;
         }
         let p = entry.path();
+        let safe_path = sanitize_display_label(&p.display().to_string());
         if is_zip(p) {
             match decrypt_zip_in_memory(p, password) {
                 Ok(mut samples) => {
@@ -194,18 +231,37 @@ pub fn collect_samples(
                     if samples.len() > room {
                         samples.truncate(room);
                     }
-                    out.append(&mut samples);
+                    // Drop members that would breach the retained-byte budget.
+                    let mut kept = Vec::with_capacity(samples.len());
+                    for sample in samples {
+                        let n = sample.data.len() as u64;
+                        if retained_bytes.saturating_add(n) > MAX_TOTAL_RETAINED_BYTES {
+                            eprintln!(
+                                "retained byte cap ({MAX_TOTAL_RETAINED_BYTES}) reached under {root_label}; truncating zip {safe_path}"
+                            );
+                            break;
+                        }
+                        retained_bytes += n;
+                        kept.push(sample);
+                    }
+                    out.append(&mut kept);
                 }
-                Err(e) => eprintln!("skip zip {}: {e:#}", p.display()),
+                Err(e) => eprintln!("skip zip {safe_path}: {e:#}"),
             }
         } else {
             match map_file(p) {
-                Ok(mmap) => out.push(QuarantinedSample::new(
-                    p.display().to_string(),
-                    None,
-                    mmap[..].to_vec(),
-                )),
-                Err(e) => eprintln!("skip {}: {e:#}", p.display()),
+                Ok(mmap) => {
+                    let n = mmap.len() as u64;
+                    if retained_bytes.saturating_add(n) > MAX_TOTAL_RETAINED_BYTES {
+                        eprintln!(
+                            "retained byte cap ({MAX_TOTAL_RETAINED_BYTES}) reached under {root_label}; stopping directory walk"
+                        );
+                        break;
+                    }
+                    retained_bytes += n;
+                    out.push(QuarantinedSample::new(safe_path, None, mmap[..].to_vec()));
+                }
+                Err(e) => eprintln!("skip {safe_path}: {e:#}"),
             }
         }
     }
@@ -218,9 +274,9 @@ pub fn decrypt_zip_in_memory(
     path: &Path,
     password: Option<&str>,
 ) -> Result<Vec<QuarantinedSample>> {
-    let file = File::open(path).with_context(|| format!("open archive {}", path.display()))?;
-    let archive_label = path.display().to_string();
-    extract_zip_members(file, &archive_label, password)
+    let safe = sanitize_display_label(&path.display().to_string());
+    let file = File::open(path).with_context(|| format!("open archive {safe}"))?;
+    extract_zip_members(file, &safe, password, None)
 }
 
 /// Find complete ZIP archives embedded in arbitrary bytes.
@@ -228,28 +284,43 @@ pub fn decrypt_zip_in_memory(
 /// Each returned range begins at a local-file header and ends after the EOCD
 /// record (including its comment). This avoids handing unrelated executable
 /// suffix bytes to the ZIP parser.
+///
+/// Malware can sprinkle `PK\x03\x04` throughout a blob. Without probe/search
+/// caps, each false local header would scan the remainder of the file for an
+/// EOCD — O(n²) CPU against a single sample. Bound probes, EOCD look-ahead,
+/// consecutive failures, and reject LOCAL hits that fail a cheap header check
+/// before any EOCD scan.
 fn embedded_zip_ranges(data: &[u8]) -> Vec<std::ops::Range<usize>> {
     const LOCAL: &[u8] = b"PK\x03\x04";
     const EOCD: &[u8] = b"PK\x05\x06";
     let mut ranges = Vec::new();
     let mut search_from = 0;
+    let mut probes = 0usize;
+    let mut consecutive_failures = 0usize;
 
-    while search_from + LOCAL.len() <= data.len() && ranges.len() < MAX_EMBEDDED_ZIPS {
-        let Some(rel_start) = data[search_from..]
-            .windows(LOCAL.len())
-            .position(|w| w == LOCAL)
-        else {
+    while search_from + LOCAL.len() <= data.len()
+        && ranges.len() < MAX_EMBEDDED_ZIPS
+        && probes < MAX_EMBEDDED_LOCAL_PROBES
+        && consecutive_failures < MAX_CONSECUTIVE_FAILED_PROBES
+    {
+        let Some(rel_start) = find_bytes(&data[search_from..], LOCAL) else {
             break;
         };
         let start = search_from + rel_start;
+        probes += 1;
+
+        if !looks_like_zip_local_header(data, start) {
+            // Cheap reject — do not burn the expensive-failure budget.
+            search_from = start + LOCAL.len();
+            continue;
+        }
+
+        let search_limit = (start.saturating_add(MAX_EOCD_SEARCH)).min(data.len());
         let mut eocd_from = start + LOCAL.len();
         let mut carved = None;
 
-        while eocd_from + 22 <= data.len() {
-            let Some(rel_eocd) = data[eocd_from..]
-                .windows(EOCD.len())
-                .position(|w| w == EOCD)
-            else {
+        while eocd_from + 22 <= search_limit {
+            let Some(rel_eocd) = find_bytes(&data[eocd_from..search_limit], EOCD) else {
                 break;
             };
             let eocd = eocd_from + rel_eocd;
@@ -258,7 +329,9 @@ fn embedded_zip_ranges(data: &[u8]) -> Vec<std::ops::Range<usize>> {
             }
             let comment_len = u16::from_le_bytes([data[eocd + 20], data[eocd + 21]]) as usize;
             let end = eocd + 22 + comment_len;
-            if end <= data.len() {
+            // Reject absurd EOCD comments that would escape the sample or the
+            // look-ahead budget (attacker-controlled u16).
+            if end <= data.len() && end.saturating_sub(start) <= MAX_EOCD_SEARCH {
                 carved = Some(start..end);
                 break;
             }
@@ -266,13 +339,63 @@ fn embedded_zip_ranges(data: &[u8]) -> Vec<std::ops::Range<usize>> {
         }
 
         if let Some(range) = carved {
+            consecutive_failures = 0;
             search_from = range.end;
             ranges.push(range);
         } else {
+            // Plausible local header but no EOCD within budget — expensive miss.
+            consecutive_failures += 1;
             search_from = start + LOCAL.len();
         }
     }
     ranges
+}
+
+/// Cheap local-file-header sanity check before spending EOCD-scan budget.
+///
+/// Dense `PK\x03\x04` noise almost never has a plausible compression method /
+/// name length; real ZIP members do.
+fn looks_like_zip_local_header(data: &[u8], start: usize) -> bool {
+    if start + 30 > data.len() {
+        return false;
+    }
+    let method = u16::from_le_bytes([data[start + 8], data[start + 9]]);
+    // Store / Deflate / Deflate64 / BZIP2 / LZMA / PPMd / AES (99).
+    if !matches!(method, 0 | 8 | 9 | 12 | 14 | 98 | 99) {
+        return false;
+    }
+    let name_len = u16::from_le_bytes([data[start + 26], data[start + 27]]) as usize;
+    let extra_len = u16::from_le_bytes([data[start + 28], data[start + 29]]) as usize;
+    if name_len > 1_024 || extra_len > 4_096 {
+        return false;
+    }
+    let header_end = start
+        .saturating_add(30)
+        .saturating_add(name_len)
+        .saturating_add(extra_len);
+    if header_end > data.len() {
+        return false;
+    }
+    if name_len > 0 {
+        let name = &data[start + 30..start + 30 + name_len];
+        // Member names are path-like ASCII; reject mostly binary "names".
+        let weird = name
+            .iter()
+            .filter(|&&b| b == 0 || !(0x20..=0x7e).contains(&b))
+            .count();
+        if weird > name_len / 4 {
+            return false;
+        }
+    }
+    true
+}
+
+/// Byte-needle search for the short fixed signatures used in ZIP carving.
+fn find_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
+    hay.windows(needle.len()).position(|w| w == needle)
 }
 
 /// Recursively carve embedded ZIPs and add their members as in-memory samples.
@@ -288,6 +411,13 @@ fn expand_embedded_archives(
     let mut out = Vec::new();
     let mut pending: Vec<(QuarantinedSample, usize)> =
         roots.into_iter().map(|sample| (sample, 0)).collect();
+    // Shared decompressed-byte budget across *all* embedded extractions in this
+    // investigation. Without it, each carved ZIP refreshed `MAX_TOTAL_EXTRACTED`
+    // and a single sample with many embedded archives could retain gigabytes.
+    let root_bytes: u64 = pending.iter().map(|(s, _)| s.data.len() as u64).sum();
+    let mut shared_budget = MAX_TOTAL_EXTRACTED.saturating_sub(root_bytes);
+    // AES PBKDF2 attempts across every embedded recovery in this pass.
+    let mut aes_attempts_left = MAX_AES_PASSWORD_ATTEMPTS;
 
     while let Some((mut sample, depth)) = pending.pop() {
         if out.len() + pending.len() >= MAX_QUARANTINED_SAMPLES {
@@ -302,6 +432,8 @@ fn expand_embedded_archives(
             break;
         }
         if depth < MAX_ARCHIVE_DEPTH {
+            // Harvest once per parent — not once per embedded archive.
+            let mut parent_candidates: Option<Vec<String>> = None;
             for (index, range) in embedded_zip_ranges(&sample.data).into_iter().enumerate() {
                 // A sample that is itself exactly a ZIP was already expanded by
                 // the outer ingest path; don't add all its members twice.
@@ -322,8 +454,15 @@ fn expand_embedded_archives(
 
                 // Best-effort decryption with the caller-supplied password first.
                 let mut recovered_password = None;
-                let mut extracted =
-                    match extract_zip_members(Cursor::new(blob), &archive_label, password) {
+                let mut extracted = if shared_budget == 0 {
+                    0
+                } else {
+                    match extract_zip_members(
+                        Cursor::new(blob),
+                        &archive_label,
+                        password,
+                        Some(&mut shared_budget),
+                    ) {
                         Ok(children) => {
                             let n = children.len();
                             for child in children {
@@ -335,18 +474,27 @@ fn expand_embedded_archives(
                             n
                         }
                         Err(_) => 0,
-                    };
+                    }
+                };
 
                 // If encrypted members remain locked, mount a candidate-password
                 // attack using printable strings from the *parent* sample. Many
                 // droppers (WannaCry: `WNcry@2ol7`) hardcode the inner password
                 // in cleartext elsewhere in the file.
-                if extracted == 0 && encrypted_members > 0 {
-                    let candidates = harvest_password_candidates(&sample.data);
-                    if let Some(pw) = try_recover_zip_password(blob, &candidates) {
-                        if let Ok(children) =
-                            extract_zip_members(Cursor::new(blob), &archive_label, Some(&pw))
-                        {
+                if extracted == 0 && encrypted_members > 0 && shared_budget > 0 {
+                    let candidates = parent_candidates
+                        .get_or_insert_with(|| harvest_password_candidates(&sample.data));
+                    if let Some(pw) = try_recover_zip_password(
+                        blob,
+                        candidates,
+                        &mut aes_attempts_left,
+                    ) {
+                        if let Ok(children) = extract_zip_members(
+                            Cursor::new(blob),
+                            &archive_label,
+                            Some(&pw),
+                            Some(&mut shared_budget),
+                        ) {
                             extracted = children.len();
                             for child in children {
                                 if out.len() + pending.len() + 1 >= MAX_QUARANTINED_SAMPLES {
@@ -389,7 +537,9 @@ fn list_zip_members<R: Read + Seek>(reader: R) -> Result<Vec<EmbeddedMember>> {
             continue;
         }
         members.push(EmbeddedMember {
-            name: meta.name().to_string(),
+            // Keep path-ish names for triage, but strip controls so malware
+            // cannot hijack the analyst terminal via ANSI/C0 in CD names.
+            name: sanitize_display_label(meta.name()),
             size: meta.size(),
             encrypted: meta.encrypted(),
         });
@@ -479,12 +629,20 @@ fn password_candidate_rank(s: &str) -> (u8, u8, usize) {
 /// and confirms success by fully decrypting + CRC-checking it (ZipCrypto's
 /// 1-byte header check alone has a ~1/256 false-accept rate). Returns the
 /// first password that decrypts cleanly.
-fn try_recover_zip_password(blob: &[u8], candidates: &[String]) -> Option<String> {
+///
+/// AES-ZIP trials are far more expensive (PBKDF2 per attempt). When the probe
+/// member is AES-encrypted we only try the top-ranked candidates and debit a
+/// shared investigation-wide AES attempt budget.
+fn try_recover_zip_password(
+    blob: &[u8],
+    candidates: &[String],
+    aes_attempts_left: &mut usize,
+) -> Option<String> {
     let mut archive = ZipArchive::new(Cursor::new(blob)).ok()?;
 
-    // Pick the cheapest encrypted member to probe — bound by declared size so
-    // a tiny compressed stream with a huge declared uncompressed size cannot
-    // become a decompression bomb during password trials.
+    // Pick the cheapest encrypted member to probe — require a small *declared*
+    // uncompressed size so a tiny compressed stream with a huge declared size
+    // cannot become a decrypt+CRC bomb across thousands of password trials.
     let scan = archive.len().min(MAX_CENTRAL_DIR_SCAN);
     let mut target = None;
     let mut best = u64::MAX;
@@ -493,7 +651,7 @@ fn try_recover_zip_password(blob: &[u8], candidates: &[String]) -> Option<String
             if m.encrypted()
                 && !m.is_dir()
                 && m.size() > 0
-                && m.size() <= MAX_MEMBER_SIZE
+                && m.size() <= MAX_PASSWORD_PROBE_BYTES
                 && m.compressed_size() < best
             {
                 best = m.compressed_size();
@@ -503,7 +661,27 @@ fn try_recover_zip_password(blob: &[u8], candidates: &[String]) -> Option<String
     }
     let (idx, declared) = target?;
 
-    for cand in candidates {
+    let is_aes = archive
+        .get_aes_verification_key_and_salt(idx)
+        .ok()
+        .flatten()
+        .is_some();
+    let limit = if is_aes {
+        if *aes_attempts_left == 0 {
+            return None;
+        }
+        candidates
+            .len()
+            .min(MAX_AES_PASSWORD_CANDIDATES)
+            .min(*aes_attempts_left)
+    } else {
+        candidates.len()
+    };
+
+    for cand in candidates.iter().take(limit) {
+        if is_aes {
+            *aes_attempts_left = aes_attempts_left.saturating_sub(1);
+        }
         match archive.by_index_decrypt(idx, cand.as_bytes()) {
             Ok(entry) => {
                 // A clean bounded read implies the CRC validated → correct password.
@@ -549,6 +727,7 @@ fn extract_zip_members<R: Read + Seek>(
     reader: R,
     archive_label: &str,
     password: Option<&str>,
+    mut shared_budget: Option<&mut u64>,
 ) -> Result<Vec<QuarantinedSample>> {
     let mut archive =
         ZipArchive::new(reader).with_context(|| format!("parse ZIP {archive_label}"))?;
@@ -612,7 +791,10 @@ fn extract_zip_members<R: Read + Seek>(
             );
             continue;
         }
-        if size > MAX_MEMBER_SIZE || total_extracted.saturating_add(size) > MAX_TOTAL_EXTRACTED {
+        let archive_room = MAX_TOTAL_EXTRACTED.saturating_sub(total_extracted);
+        let shared_room = shared_budget.as_ref().map(|b| **b).unwrap_or(u64::MAX);
+        let room = archive_room.min(shared_room);
+        if size > MAX_MEMBER_SIZE || size > room {
             eprintln!(
                 "skip oversized ZIP member in {archive_label}: {} ({size} bytes)",
                 sanitize_member_name(&name)
@@ -620,7 +802,7 @@ fn extract_zip_members<R: Read + Seek>(
             continue;
         }
 
-        let budget = MAX_TOTAL_EXTRACTED.saturating_sub(total_extracted);
+        let budget = room;
 
         if encrypted {
             encrypted_seen = true;
@@ -659,6 +841,9 @@ fn extract_zip_members<R: Read + Seek>(
                 }
             };
             total_extracted = total_extracted.saturating_add(data.len() as u64);
+            if let Some(b) = shared_budget.as_deref_mut() {
+                *b = b.saturating_sub(data.len() as u64);
+            }
 
             samples.push(QuarantinedSample::new(
                 format!("{archive_label}::{member}"),
@@ -673,6 +858,9 @@ fn extract_zip_members<R: Read + Seek>(
             let data = read_zip_member_bounded(entry, size, budget)
                 .with_context(|| format!("read ZIP member {member}"))?;
             total_extracted = total_extracted.saturating_add(data.len() as u64);
+            if let Some(b) = shared_budget.as_deref_mut() {
+                *b = b.saturating_sub(data.len() as u64);
+            }
             samples.push(QuarantinedSample::new(
                 format!("{archive_label}::{member}"),
                 Some(archive_label.to_string()),
@@ -751,11 +939,17 @@ fn is_unsafe_zip_path(name: &str) -> bool {
 
 fn sanitize_member_name(name: &str) -> String {
     // Flatten to a single path component for labels; reject traversal earlier.
-    let cleaned = name.replace('\0', "");
-    PathBuf::from(&cleaned)
+    // Strip C0/C1 controls so malware member names cannot hijack terminal output.
+    let cleaned = sanitize_display_label(name);
+    let leaf = PathBuf::from(&cleaned)
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| cleaned.replace(['/', '\\'], "_"))
+        .unwrap_or_else(|| cleaned.replace(['/', '\\'], "_"));
+    if leaf.is_empty() {
+        "unnamed".into()
+    } else {
+        leaf
+    }
 }
 
 #[cfg(test)]
@@ -973,7 +1167,7 @@ mod tests {
     #[test]
     fn extract_skips_traversal_member_names() {
         let zip = test_zip("../evil.exe", b"MZ");
-        let samples = extract_zip_members(Cursor::new(zip), "t.zip", None);
+        let samples = extract_zip_members(Cursor::new(zip), "t.zip", None, None);
         // Sole member rejected → empty archive error.
         assert!(samples.is_err());
     }
@@ -994,5 +1188,120 @@ mod tests {
         let err = map_file(&path).unwrap_err();
         assert!(format!("{err:#}").contains("exceeds max sample size"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dense_pk_noise_carve_stays_bounded() {
+        // Quadratic-carve bomb: packed local headers, no EOCD. Must finish
+        // quickly under the probe/look-ahead/failure caps.
+        let n = 256 * 1024;
+        let mut data = vec![0u8; n];
+        for i in (0..n.saturating_sub(4)).step_by(4) {
+            data[i..i + 4].copy_from_slice(b"PK\x03\x04");
+        }
+        let started = std::time::Instant::now();
+        let ranges = embedded_zip_ranges(&data);
+        let elapsed = started.elapsed();
+        assert!(ranges.is_empty());
+        assert!(
+            elapsed < std::time::Duration::from_millis(250),
+            "dense PK carve took {elapsed:?}; probe/search caps likely regressing"
+        );
+    }
+
+    #[test]
+    fn still_carves_valid_embedded_zip_amid_noise() {
+        let zip = test_zip("c.wnry", b"gx7ekbenv2riucmf.onion");
+        let mut data = Vec::new();
+        // Leading false PK signatures that fail header validation.
+        for _ in 0..32 {
+            data.extend_from_slice(b"PK\x03\x04XXXX");
+        }
+        data.extend_from_slice(&zip);
+        let ranges = embedded_zip_ranges(&data);
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(&data[ranges[0].clone()], zip.as_slice());
+    }
+
+    #[test]
+    fn sanitize_strips_control_chars_from_member_names() {
+        assert_eq!(sanitize_member_name("evil\x1b[31m.exe"), "evil[31m.exe");
+        assert_eq!(sanitize_member_name("msg/\x07payload.exe"), "payload.exe");
+        assert_eq!(sanitize_display_label("a\x1b[31mb\0c"), "a[31mbc");
+    }
+
+    #[test]
+    fn password_recovery_skips_huge_declared_probe_members() {
+        // Only member is encrypted with a declared size far above the probe
+        // cap — recovery must refuse to use it as an oracle (returns None)
+        // rather than decrypting hundreds of MiB per candidate.
+        let zip = encrypted_zip(
+            &[(
+                "huge.bin",
+                &vec![0u8; (MAX_PASSWORD_PROBE_BYTES as usize) + 1],
+            )],
+            "WNcry@2ol7",
+        );
+        let parent = b"prefix\x00WNcry@2ol7\x00suffix";
+        let cands = harvest_password_candidates(parent);
+        assert!(cands.iter().any(|c| c == "WNcry@2ol7"));
+        let mut aes = MAX_AES_PASSWORD_ATTEMPTS;
+        assert!(try_recover_zip_password(&zip, &cands, &mut aes).is_none());
+    }
+
+    #[test]
+    fn password_recovery_still_works_on_small_members() {
+        let zip = encrypted_zip(&[("c.wnry", b"gx7ekbenv2riucmf.onion")], "WNcry@2ol7");
+        let parent = b"prefix\x00WNcry@2ol7\x00suffix";
+        let cands = harvest_password_candidates(parent);
+        let mut aes = MAX_AES_PASSWORD_ATTEMPTS;
+        assert_eq!(
+            try_recover_zip_password(&zip, &cands, &mut aes).as_deref(),
+            Some("WNcry@2ol7")
+        );
+    }
+
+    #[test]
+    fn extract_respects_shared_byte_budget() {
+        let zip = test_zip("a.bin", &vec![b'A'; 1_000]);
+        let mut budget = 100u64;
+        let err = extract_zip_members(Cursor::new(zip), "t.zip", None, Some(&mut budget));
+        // Declared size 1000 > shared room 100 → skip → empty archive error.
+        assert!(err.is_err());
+        assert_eq!(budget, 100);
+    }
+
+    #[test]
+    fn aes_password_recovery_honours_attempt_budget() {
+        let zip = encrypted_zip(&[("c.wnry", b"payload")], "real-secret-pw");
+        // Pad with higher-ranked decoys so the real password sits past the AES cap.
+        let mut cands: Vec<String> = (0..MAX_AES_PASSWORD_CANDIDATES)
+            .map(|i| format!("Decoy!pass{i}"))
+            .collect();
+        cands.push("real-secret-pw".into());
+        let mut aes_left = MAX_AES_PASSWORD_CANDIDATES; // exactly the per-archive AES cap
+        assert!(try_recover_zip_password(&zip, &cands, &mut aes_left).is_none());
+        assert_eq!(aes_left, 0);
+    }
+
+    #[test]
+    fn directory_ingest_honours_retained_byte_budget() {
+        // Three ~200 KiB files would fit a tiny synthetic cap of 450 KiB only
+        // twice — exercise the same saturating add used by collect_samples.
+        let mut retained = 0u64;
+        let cap = 450 * 1024u64;
+        let sizes = [200 * 1024u64, 200 * 1024, 200 * 1024];
+        let mut kept = 0usize;
+        for n in sizes {
+            if retained.saturating_add(n) > cap {
+                break;
+            }
+            retained += n;
+            kept += 1;
+        }
+        assert_eq!(kept, 2);
+        assert!(retained <= cap);
+        // Production constant must stay aligned with the per-file ceiling.
+        assert_eq!(MAX_TOTAL_RETAINED_BYTES, crate::util::MAX_SAMPLE_BYTES);
     }
 }
