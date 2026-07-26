@@ -7,7 +7,7 @@ use crate::containment::{EmbeddedArchive, QuarantinedSample};
 use crate::crypto::{CryptoFinding, XorRecovery, scan as scan_crypto, scan_pairwise_across, scan_xor};
 use crate::disasm::{DisasmReport, ExtractedString, disassemble, interesting_strings};
 use crate::heuristics::{CapabilityTag, ThreatScore, capability_summary, score_imports_with_string_apis};
-use crate::iocs::{IocKind, NetworkIoc, scan_data as scan_iocs};
+use crate::iocs::{IocKind, NetworkIoc, scan_data as scan_iocs, scan_data_limited};
 use crate::secrets::{SecretCandidate, scan as scan_secrets};
 use crate::signatures::{YaraMatch, build_hash_bundle, scan_yara};
 use crate::toolchain::ToolchainFinding;
@@ -21,8 +21,6 @@ pub struct ImpHashCluster {
     pub imphash: String,
     pub members: Vec<String>,
     pub max_score: u8,
-    /// VirusTotal intelligence pivot (open in browser; no API key required).
-    pub virustotal_search: String,
 }
 
 #[derive(Debug, Clone)]
@@ -50,6 +48,16 @@ pub struct DeepDive {
     pub disasm: Option<DisasmReport>,
 }
 
+/// Hardcoded network / C2 candidates found in a sample (static strings + DNS APIs).
+#[derive(Debug, Clone)]
+pub struct NetworkFindings {
+    pub path: String,
+    pub sha256: String,
+    pub iocs: Vec<NetworkIoc>,
+    /// Imported name-resolution APIs (`DnsQuery`, `getaddrinfo`, …).
+    pub dns_apis: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct InvestigationReport {
     pub source: String,
@@ -57,6 +65,8 @@ pub struct InvestigationReport {
     pub triage: Vec<TriageReport>,
     pub ranking: Vec<(String, u8, String)>,
     pub imphash_clusters: Vec<ImpHashCluster>,
+    /// Per-sample C2 / network indicators (every member, not only deep-dives).
+    pub network_findings: Vec<NetworkFindings>,
     pub yara_by_sample: Vec<(String, Vec<YaraMatch>)>,
     pub deep_dives: Vec<DeepDive>,
 }
@@ -76,11 +86,12 @@ pub struct InvestigateOptions<'a> {
 impl Default for InvestigateOptions<'_> {
     fn default() -> Self {
         Self {
-            deep: 3,
-            disasm_count: 512,
+            // Deep by default: every interesting member, large disasm budget.
+            deep: usize::MAX,
+            disasm_count: 32_768,
             yara_rules: None,
-            min_deep_score: 70,
-            max_deep: 8,
+            min_deep_score: 0,
+            max_deep: usize::MAX,
             full: false,
         }
     }
@@ -552,6 +563,9 @@ pub fn investigate(
         .map(|s| (s.label.as_str(), s.embedded_archives.as_slice()))
         .collect();
 
+    // Hardcoded C2 / network IOCs for every member (default report surface).
+    let network_findings = collect_network_findings(samples, &triage, &data_by_label);
+
     // One YARA pass per sample — reused for ranking signals and deep-dives.
     let mut yara_hits: BTreeMap<String, Vec<YaraMatch>> = BTreeMap::new();
     for r in &triage {
@@ -567,18 +581,25 @@ pub fn investigate(
         .map(|(path, hits)| (path.clone(), hits.clone()))
         .collect();
 
-    // Deep-dive: top `deep` by score, then fill remaining slots up to `max_deep`
-    // with samples scoring >= min_deep_score (prevents tied floors from exploding).
+    // Deep-dive: every executable, plus scored members (or >= min_deep_score).
+    // Defaults are unlimited so `vanguard <path>` goes as deep as it can; score-0
+    // demoted noise (language packs, etc.) is skipped unless min_deep_score is 0
+    // *and* the member is an executable.
     let ceiling = opts.max_deep.max(opts.deep);
-    let mut deep_targets: Vec<&TriageReport> = triage.iter().take(opts.deep).collect();
-    for r in triage.iter().skip(opts.deep) {
-        if deep_targets.len() >= ceiling {
-            break;
-        }
-        if r.threat.score >= opts.min_deep_score {
-            deep_targets.push(r);
-        }
-    }
+    let deep_targets: Vec<&TriageReport> = triage
+        .iter()
+        .filter(|r| {
+            if r.binary.format.is_executable() {
+                return true;
+            }
+            if opts.min_deep_score == 0 {
+                r.threat.score > 0
+            } else {
+                r.threat.score >= opts.min_deep_score
+            }
+        })
+        .take(ceiling)
+        .collect();
 
     let mut deep_dives = Vec::new();
     for r in deep_targets {
@@ -590,8 +611,8 @@ pub fn investigate(
         // strings from the full sample below (with_strings: false).
         let disasm = disassemble(&r.path, data, None, opts.disasm_count, false).ok();
         let strings = {
-            let all = crate::disasm::extract_strings_ranked(data, 8_000);
-            interesting_strings(&all).into_iter().take(120).collect()
+            let all = crate::disasm::extract_strings_ranked(data, 24_000);
+            interesting_strings(&all).into_iter().take(400).collect()
         };
 
         let reason = {
@@ -612,12 +633,13 @@ pub fn investigate(
             }
         };
 
-        let mut network_iocs = scan_iocs(data);
-        // Merge indicators recovered from this sample's own decrypted embedded
-        // members (e.g. WannaCry's `c.wnry` Tor C2 list, unlocked once the
-        // inner ZIP password was cracked). Only hostname-class indicators are
-        // pulled up: bare IPs buried inside a bundled Tor binary are that
-        // component's infrastructure, not this sample's C2, and would mislead.
+        // Prefer the whole-archive scan; enrich with hostname-class IOCs from
+        // decrypted embedded children (e.g. WannaCry `c.wnry` Tor C2 list).
+        let mut network_iocs = network_findings
+            .iter()
+            .find(|n| n.path == r.path)
+            .map(|n| n.iocs.clone())
+            .unwrap_or_else(|| scan_iocs(data));
         let child_prefix = format!("{}::", r.path);
         for child in samples
             .iter()
@@ -685,9 +707,81 @@ pub fn investigate(
         triage,
         ranking,
         imphash_clusters,
+        network_findings,
         yara_by_sample,
         deep_dives,
     })
+}
+
+fn collect_network_findings(
+    samples: &[QuarantinedSample],
+    triage: &[TriageReport],
+    data_by_label: &BTreeMap<&str, &[u8]>,
+) -> Vec<NetworkFindings> {
+    let mut out = Vec::new();
+    for r in triage {
+        let Some(data) = data_by_label.get(r.path.as_str()) else {
+            continue;
+        };
+        let mut iocs = scan_data_limited(data, 80);
+        iocs.retain(|i| i.kind.is_c2_candidate());
+        let dns_apis = dns_apis_from_imports(&r.binary.imports);
+        if iocs.is_empty() && dns_apis.is_empty() {
+            continue;
+        }
+        out.push(NetworkFindings {
+            path: r.path.clone(),
+            sha256: r.sha256.clone(),
+            iocs,
+            dns_apis,
+        });
+    }
+    // Also cover members that failed triage but still have bytes (rare).
+    for s in samples {
+        if out.iter().any(|n| n.path == s.label) {
+            continue;
+        }
+        let mut iocs = scan_data_limited(&s.data, 80);
+        iocs.retain(|i| i.kind.is_c2_candidate());
+        if iocs.is_empty() {
+            continue;
+        }
+        let sha256 = crate::signatures::hash_file(&s.data).1;
+        out.push(NetworkFindings {
+            path: s.label.clone(),
+            sha256,
+            iocs,
+            dns_apis: Vec::new(),
+        });
+    }
+    out.sort_by(|a, b| {
+        let ac = a.iocs.first().map(|i| i.confidence).unwrap_or(0);
+        let bc = b.iocs.first().map(|i| i.confidence).unwrap_or(0);
+        bc.cmp(&ac)
+            .then(b.iocs.len().cmp(&a.iocs.len()))
+            .then(a.path.cmp(&b.path))
+    });
+    out
+}
+
+fn dns_apis_from_imports(imports: &[crate::triage::ImportEntry]) -> Vec<String> {
+    let mut hits = Vec::new();
+    for imp in imports {
+        let lower = imp.function.to_ascii_lowercase();
+        if lower.starts_with("dnsquery")
+            || lower.starts_with("getaddrinfo")
+            || lower == "gethostbyname"
+            || lower == "gethostbyaddr"
+            || lower.starts_with("inet_addr")
+            || lower.starts_with("inetpton")
+            || lower.starts_with("wsalookupservice")
+        {
+            hits.push(imp.function.clone());
+        }
+    }
+    hits.sort();
+    hits.dedup();
+    hits
 }
 
 fn attach_cross_sample_xor(
@@ -770,9 +864,6 @@ fn cluster_imphash(triage: &[TriageReport]) -> Vec<ImpHashCluster> {
             let max_score = members.iter().map(|m| m.threat.score).max().unwrap_or(0);
             let names: Vec<String> = members.iter().map(|m| short_name(&m.path)).collect();
             ImpHashCluster {
-                virustotal_search: format!(
-                    "https://www.virustotal.com/gui/search/imphash%3A{imphash}"
-                ),
                 imphash,
                 members: names,
                 max_score,

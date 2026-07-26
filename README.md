@@ -31,7 +31,7 @@ High-speed, memory-safe static malware triage from the command line.
 | **Triage** | PE/ELF/Mach-O headers, ImpHash, entropy / packer hints, IAT threat score, capability tags |
 | **Toolchain** | Source-language / compiler fingerprints (Go, Rust, .NET, MSVC via Rich header, GCC/MinGW, Delphi, VB6, Nim, AutoIt, PyInstaller) with the artifacts that matched; weak Delphi strings (`Borland`, …) are ignored on Raw blobs |
 | **Signatures** | Lightweight builtin string/byte rules (no YARA-X / Wasmtime); Delphi section rule is gated on Delphi toolchain markers; WinINet dyn-resolve string rule requires `LoadLibrary`+`GetProcAddress` plus `InternetOpenUrl` or ≥4 WinINet names |
-| **Network IOCs** | Hardcoded IPv4 / `ip:port`, URLs, domains, `.onion`, emails, checksum-validated Bitcoin wallets — ranked by confidence; vendor schema / truncated-host noise is filtered |
+| **Network / C2** | Hardcoded IPv4 / IPv6 / `ip:port`, URLs, domains, `.onion` (+ DNS-resolve APIs) — scanned on every member and shown in the default report; emails / Bitcoin wallets also extracted; vendor schema noise is filtered |
 | **Embedded archives** | Carves ZIP signatures from executable/resource bytes, decrypts members in memory, and recursively analyzes them with bomb limits |
 | **Credential recovery** | Cracks encrypted embedded ZIPs by trying the sample's own plaintext strings as passwords (recovers WannaCry's `WNcry@2ol7`), then unlocks + analyzes the payload |
 | **Possible secrets** | Heuristic password / API-key candidates; passwords need a nearby credential keyword (`password`, `login`, …) and only ≥75 print in the CLI |
@@ -54,6 +54,8 @@ Threat scores come from IAT pattern matches and capability tags. Labels are buil
 | `c2_suspect` | Stronger HTTP combo (download-to-file or multi-API WinINet) |
 | `persistence` | Services, run keys, tasks |
 | `file_delete` / `file_drop` | Cleanup helpers and droppers |
+| `exec` | Process-creation APIs (`CreateProcess`, `ShellExecute`, `system` / `exec*`, …) |
+| `script_exec` | Shell/script/LOLBin **strings** (`powershell`, `cmd.exe`, `/bin/sh`, `rundll32`, …); confidence rises when an `exec` API is also present. Static only — does not prove the process ran |
 | `crypto`, `anti_debug`, `keylog`, … | As matched |
 
 Additional ranking rules:
@@ -68,7 +70,7 @@ Additional ranking rules:
 - **`Ex` APIs are distinct** — `VirtualAlloc` does not match `VirtualAllocEx`; injection needs ≥2 corroborating APIs
 - Ranking labels prefer including a network capability (`smb_enum` / `socket_client` / `http_client` / `c2_suspect`) when matched
 - **Thin-IAT / delay-load** samples that already show `LoadLibrary`+`GetProcAddress` also get exact WinINet/WinHTTP API **name strings** folded into capability tagging (so `InternetOpenUrl` as a string can yield `http_client`)
-- Deep-dives are capped by `--max-deep` so a low `--min-deep-score` cannot expand to the whole archive on tied floors
+- Deep-dives run by default on every executable and every scored member (disasm budget 32k insn); pass `--max-deep` only if you need to throttle huge archives
 - **Delphi toolchain** weak string markers (`Borland`, …) are ignored on Raw/source blobs; PE/ELF/Mach-O still accept them
 
 ## Build & install
@@ -77,6 +79,10 @@ Additional ranking rules:
 # Fast check while iterating
 cargo check
 
+# Rebuild release + install onto PATH (~/.local/bin)
+./install.sh
+
+# Or manually:
 cargo build --release
 cp target/release/vanguard ~/.local/bin/vanguard
 ```
@@ -86,17 +92,19 @@ Builtin signature rules are a lightweight string/byte matcher. External `.yar` f
 ## Usage
 
 ```bash
-vanguard <PATH> [--password infected] [--deep 3] [--max-deep 8] [--disasm-count 4000] [--min-deep-score 70] [--full]
+vanguard <PATH>
 ```
+
+Default report includes triage, ImpHash clusters, hardcoded C2/network IOCs (IPv4/IPv6, domains, URLs, onion + DNS APIs), and **deep-dives on every executable / scored member** (large disasm budget).
 
 | Flag | Default | Meaning |
 |------|---------|---------|
 | `--password` / `-p` | `infected` | Password for encrypted ZIP archives |
-| `--deep` | `3` | Number of top-scoring samples to deep-dive |
-| `--max-deep` | `8` | Absolute ceiling on deep-dives (top `--deep` plus min-score fill) |
-| `--disasm-count` | `4000` | Max instructions to decode per deep-dive |
-| `--min-deep-score` | `70` | Also deep-dive lower-ranked samples at/above this score, up to `--max-deep` |
+| `--deep` / `--max-deep` | unlimited | Cap how many members get a deep-dive (default: no cap) |
+| `--disasm-count` | `32768` | Max instructions to decode per deep-dive |
+| `--min-deep-score` | `0` | Non-executables at/above this score are also deep-dived (executables always are) |
 | `--full` | off | Keep language packs / source / raw noise in ranking **and** print full member lists + every triage block |
+| `--color` | `auto` | ANSI colors in the report: `auto` (TTY + no `NO_COLOR`), `always`, or `never` |
 
 Examples:
 

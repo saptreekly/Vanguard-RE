@@ -1,5 +1,6 @@
 //! Signature engine: ImpHash, file hashes, lightweight builtin pattern rules.
 
+mod ordlookup;
 mod yara_rules;
 
 use md5::{Digest, Md5};
@@ -33,6 +34,9 @@ pub fn hash_file(data: &[u8]) -> (String, String) {
 
 /// Mandiant ImpHash: lowercase `dll.function` entries in **IAT order** (no
 /// alphabetical sort — reordering imports changes the hash and is the point).
+///
+/// Ordinals for `oleaut32` / `ws2_32` / `wsock32` are resolved via the frozen
+/// pefile/YARA tables so values match VirusTotal.
 pub fn compute_imphash(imports: &[ImportEntry]) -> Option<String> {
     if imports.is_empty() {
         return None;
@@ -44,7 +48,7 @@ pub fn compute_imphash(imports: &[ImportEntry]) -> Option<String> {
             continue;
         }
         let dll = normalize_dll(&imp.library);
-        let func = normalize_func(&imp.function);
+        let func = normalize_func(&dll, &imp.function);
         if dll.is_empty() || func.is_empty() {
             continue;
         }
@@ -70,15 +74,13 @@ fn normalize_dll(dll: &str) -> String {
         .to_string()
 }
 
-fn normalize_func(func: &str) -> String {
-    let f = func.trim();
-    if let Some(rest) = f.strip_prefix('#') {
-        return format!("ord{rest}");
+fn normalize_func(dll_stem: &str, func: &str) -> String {
+    if let Some(ord) = ordlookup::parse_ordinal_label(func) {
+        // Lookup keys include the extension, matching pefile's imphash_ords.
+        let dll_key = format!("{dll_stem}.dll");
+        return ordlookup::resolve_imphash_ordinal(&dll_key, ord);
     }
-    if let Some(rest) = f.strip_prefix("Ordinal ") {
-        return format!("ord{rest}");
-    }
-    f.to_ascii_lowercase()
+    func.trim().to_ascii_lowercase()
 }
 
 pub fn build_hash_bundle(data: &[u8], imports: &[ImportEntry]) -> HashBundle {
@@ -153,6 +155,46 @@ mod tests {
         assert_eq!(
             compute_imphash(&b).unwrap(),
             "b1c7936280315755bcad849d77149970"
+        );
+    }
+
+    #[test]
+    fn imphash_resolves_ws2_32_ordinals() {
+        // Without resolution this would hash `ws2_32.ordinal 8` (wrong).
+        let imports = vec![ImportEntry {
+            library: "WS2_32.dll".into(),
+            function: "ORDINAL 8".into(),
+        }];
+        let joined_md5 = {
+            let mut h = Md5::new();
+            h.update(b"ws2_32.htonl");
+            hex::encode(h.finalize())
+        };
+        assert_eq!(compute_imphash(&imports).unwrap(), joined_md5);
+    }
+
+    #[test]
+    fn fanny_imphash_matches_virustotal() {
+        // Regression: Fanny's sole ordinal import is WS2_32!8 → htonl.
+        // Full IAT is large; this asserts the live sample when present.
+        let path = std::path::Path::new(
+            "/Users/jackweekly/Documents/Malware/EquationGroup.Fanny/EquationGroup.Fanny.zip",
+        );
+        if !path.exists() {
+            return;
+        }
+        let samples =
+            crate::containment::collect_samples(path, false, Some("infected")).expect("collect");
+        let pe = samples
+            .iter()
+            .find(|s| s.data.len() > 2 && s.data[..2] == *b"MZ")
+            .expect("PE member");
+        let parsed = crate::triage::parse_binary_named(&pe.data, false, Some(&pe.label))
+            .expect("parse");
+        let hash = compute_imphash(&parsed.imports).expect("imphash");
+        assert_eq!(
+            hash, "1f5e76572fad36553733428ca3571f53",
+            "Fanny ImpHash must match VirusTotal / pefile"
         );
     }
 }

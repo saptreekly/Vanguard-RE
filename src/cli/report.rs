@@ -2,41 +2,62 @@ use std::path::Path;
 use std::time::{Duration, UNIX_EPOCH};
 
 use vanguard_re::containment::{EmbeddedArchive, QuarantinedSample};
-use vanguard_re::investigate::{short_name, DeepDive, InvestigationReport};
+use vanguard_re::iocs::IocKind;
+use vanguard_re::investigate::{short_name, DeepDive, InvestigationReport, NetworkFindings};
 use vanguard_re::triage::TriageReport;
+
+use super::style::{ColorChoice, Style};
 
 /// Options controlling how much detail the CLI dumps.
 #[derive(Debug, Clone, Copy)]
 pub struct PrintOptions {
     /// When true, print every member and every triage block (including demoted / score-0).
     pub full: bool,
+    /// ANSI color preference for the report.
+    pub color: ColorChoice,
 }
 
 impl Default for PrintOptions {
     fn default() -> Self {
-        Self { full: false }
+        Self {
+            full: false,
+            color: ColorChoice::Auto,
+        }
     }
 }
 
 const RANKING_SHOW: usize = 12;
 const STRING_CAP: usize = 40;
 const EMBEDDED_MEMBER_CAP: usize = 12;
+const IMPORT_WRAP: usize = 72;
 const RULE: &str = "────────────────────────────────────────────────────────────";
 
-/// Print the investigation report: summary → ranking → ImpHash → per-sample blocks.
+/// Print the investigation report: summary → ranking → ImpHash → C2 → samples.
 pub fn print_report(
     path: &Path,
     samples: &[QuarantinedSample],
     report: &InvestigationReport,
     opts: PrintOptions,
 ) {
-    print_banner(path, samples, report);
-    print_ranking(report, opts);
-    print_imphash_clusters(report);
-    print_samples(report, opts);
+    let sty = Style::from_preference(opts.color);
+    print_banner(path, samples, report, sty);
+    print_ranking(report, opts, sty);
+    print_imphash_clusters(report, sty);
+    print_c2_section(report, sty);
+    print_samples(report, opts, sty);
 }
 
-fn print_banner(path: &Path, samples: &[QuarantinedSample], report: &InvestigationReport) {
+fn print_section_title(sty: Style, title: &str) {
+    println!("\n{}", sty.section(title));
+    println!("{}", sty.rule(RULE));
+}
+
+fn print_banner(
+    path: &Path,
+    samples: &[QuarantinedSample],
+    report: &InvestigationReport,
+    sty: Style,
+) {
     let total_bytes: u64 = samples.iter().map(|s| s.data.len() as u64).sum();
     let mut counts = std::collections::BTreeMap::<String, usize>::new();
     for t in &report.triage {
@@ -52,35 +73,47 @@ fn print_banner(path: &Path, samples: &[QuarantinedSample], report: &Investigati
             .join(" ")
     };
 
-    println!("VANGUARD-RE");
-    println!("{RULE}");
-    println!("  source   {}", path.display());
+    println!("{}", sty.brand("VANGUARD-RE"));
+    println!("{}", sty.rule(RULE));
+    println!("{}", sty.field("source", &path.display().to_string()));
     println!(
-        "  members  {}  ·  {}  ·  {}",
-        samples.len(),
-        human_bytes(total_bytes),
-        mix
+        "{}",
+        sty.field(
+            "members",
+            &format!("{}  ·  {}  ·  {}", samples.len(), human_bytes(total_bytes), mix)
+        )
     );
     if let Some((name, score, label)) = report.ranking.first() {
         println!(
-            "  top hit  {}  score={}  {}",
-            display_name(name),
-            score,
-            label
+            "{}",
+            sty.field(
+                "top hit",
+                &format!(
+                    "{}  {}  {}",
+                    sty.emph(&display_name(name)),
+                    sty.badge(*score),
+                    sty.label(label, *score)
+                )
+            )
         );
     }
     println!(
-        "  deep     {} sample(s)  ·  clusters {}",
-        report.deep_dives.len(),
-        report.imphash_clusters.len()
+        "{}",
+        sty.field(
+            "deep",
+            &format!(
+                "{} sample(s)  ·  clusters {}",
+                report.deep_dives.len(),
+                report.imphash_clusters.len()
+            )
+        )
     );
 }
 
-fn print_ranking(report: &InvestigationReport, opts: PrintOptions) {
-    println!("\nRANKING");
-    println!("{RULE}");
+fn print_ranking(report: &InvestigationReport, opts: PrintOptions, sty: Style) {
+    print_section_title(sty, "RANKING");
     if report.ranking.is_empty() {
-        println!("  (empty)");
+        println!("  {}", sty.dim("(empty)"));
         return;
     }
 
@@ -98,12 +131,19 @@ fn print_ranking(report: &InvestigationReport, opts: PrintOptions) {
         nonzero.iter().copied().take(RANKING_SHOW).collect()
     };
 
-    println!("  {:>3}  {:>5}  {:<22}  {}", "#", "score", "name", "label");
+    println!(
+        "  {}  {}  {}  {}",
+        sty.dim(&format!("{:>3}", "#")),
+        sty.dim(&format!("{:>5}", "score")),
+        sty.dim(&format!("{:<22}", "name")),
+        sty.dim("label")
+    );
     for (i, (name, score, label)) in &rows {
         println!(
-            "  {i:>3}  {score:>5}  {:<22}  {}",
+            "  {i:>3}  {}  {:<22}  {}",
+            sty.score_text(*score, &format!("{score:>5}")),
             truncate(&display_name(name), 22),
-            label
+            sty.label(label, *score)
         );
     }
     if !opts.full {
@@ -115,12 +155,16 @@ fn print_ranking(report: &InvestigationReport, opts: PrintOptions) {
             notes.push(format!("{zero} at score 0"));
         }
         if !notes.is_empty() {
-            println!("  … {}  (use --full)", notes.join(" · "));
+            println!(
+                "  {} {}  (use --full)",
+                sty.dim("…"),
+                sty.dim(&notes.join(" · "))
+            );
         }
     }
 }
 
-fn print_imphash_clusters(report: &InvestigationReport) {
+fn print_imphash_clusters(report: &InvestigationReport, sty: Style) {
     let clusters: Vec<_> = report
         .imphash_clusters
         .iter()
@@ -129,25 +173,70 @@ fn print_imphash_clusters(report: &InvestigationReport) {
     if clusters.is_empty() {
         return;
     }
-    println!("\nIMPHASH");
-    println!("{RULE}");
+    print_section_title(sty, "IMPHASH");
     for c in clusters {
         let members: Vec<_> = c.members.iter().map(|m| display_name(m)).collect();
         println!(
-            "  {}  max={:<3}  {}",
-            c.imphash,
-            c.max_score,
+            "  {}  max={}  {}",
+            sty.hash(&c.imphash),
+            sty.score_text(c.max_score, &format!("{:<3}", c.max_score)),
             members.join(", ")
         );
-        println!("           {}", c.virustotal_search);
     }
 }
 
-fn print_samples(report: &InvestigationReport, opts: PrintOptions) {
+fn print_c2_section(report: &InvestigationReport, sty: Style) {
+    if report.network_findings.is_empty() {
+        return;
+    }
+    print_section_title(sty, "C2");
+    println!(
+        "  {}",
+        sty.dim("Hardcoded hosts/IPs from sample strings — nothing resolved or contacted")
+    );
+    for n in &report.network_findings {
+        let top = n
+            .iocs
+            .iter()
+            .take(3)
+            .map(|i| i.value.as_str())
+            .collect::<Vec<_>>()
+            .join("  ·  ");
+        let extra = n.iocs.len().saturating_sub(3);
+        let dns = if n.dns_apis.is_empty() {
+            String::new()
+        } else {
+            format!("  dns={}", n.dns_apis.join(","))
+        };
+        let more = if extra > 0 {
+            format!("  (+{extra})")
+        } else {
+            String::new()
+        };
+        println!(
+            "  {}  {}{}{}",
+            sty.emph(&truncate(&display_name(&n.path), 28)),
+            if top.is_empty() {
+                sty.dim("DNS APIs only").to_string()
+            } else {
+                top
+            },
+            more,
+            sty.dim(&dns)
+        );
+    }
+}
+
+fn print_samples(report: &InvestigationReport, opts: PrintOptions, sty: Style) {
     let deep_by_sha: std::collections::HashMap<&str, &DeepDive> = report
         .deep_dives
         .iter()
         .map(|d| (d.sha256.as_str(), d))
+        .collect();
+    let net_by_sha: std::collections::HashMap<&str, &NetworkFindings> = report
+        .network_findings
+        .iter()
+        .map(|n| (n.sha256.as_str(), n))
         .collect();
 
     let mut ordered: Vec<&TriageReport> = report
@@ -164,14 +253,20 @@ fn print_samples(report: &InvestigationReport, opts: PrintOptions) {
     });
 
     let skipped = report.triage.len().saturating_sub(ordered.len());
-    println!("\nSAMPLES  ({})", ordered.len());
+    println!("\n{}  ({})", sty.section("SAMPLES"), ordered.len());
     if skipped > 0 && !opts.full {
-        println!("  skipped {skipped} low-interest  ·  use --full for all");
+        println!(
+            "  {}",
+            sty.dim(&format!(
+                "skipped {skipped} low-interest  ·  use --full for all"
+            ))
+        );
     }
 
     for t in ordered {
         let deep = deep_by_sha.get(t.sha256.as_str()).copied();
-        print_sample_block(t, deep, opts);
+        let net = net_by_sha.get(t.sha256.as_str()).copied();
+        print_sample_block(t, deep, net, opts, sty);
     }
 }
 
@@ -179,23 +274,35 @@ fn should_print_sample(t: &TriageReport, opts: PrintOptions) -> bool {
     opts.full || t.threat.score >= 20 || t.binary.format.is_executable()
 }
 
-fn print_sample_block(t: &TriageReport, deep: Option<&DeepDive>, opts: PrintOptions) {
+fn print_sample_block(
+    t: &TriageReport,
+    deep: Option<&DeepDive>,
+    net: Option<&NetworkFindings>,
+    opts: PrintOptions,
+    sty: Style,
+) {
     let name = display_name(&t.path);
     println!();
-    println!("{RULE}");
     println!(
-        "  {}   score {:>3}   {}",
-        truncate(&name, 40),
-        t.threat.score,
-        t.threat.label
+        "{} {}  {}  {}",
+        sty.rule("──"),
+        sty.emph(&truncate(&name, 40)),
+        sty.badge(t.threat.score),
+        sty.label(&t.threat.label, t.threat.score)
     );
-    println!("{RULE}");
 
-    println!("  member   {}", member_path(&t.path));
-    println!("  sha256   {}", t.sha256);
-    println!("  md5      {}", t.hashes.md5);
+    println!("{}", sty.field("member", &member_path(&t.path)));
+    println!("{}", sty.field("sha256", &sty.hash(&t.sha256)));
+    println!(
+        "             {}",
+        sty.url(&format!(
+            "https://www.virustotal.com/gui/file/{}",
+            t.sha256
+        ))
+    );
+    println!("{}", sty.field("md5", &sty.hash(&t.hashes.md5)));
     if let Some(h) = &t.hashes.imphash {
-        println!("  imphash  {h}");
+        println!("{}", sty.field("imphash", &sty.hash(h)));
     }
 
     let mut identity = vec![
@@ -212,26 +319,47 @@ fn print_sample_block(t: &TriageReport, deep: Option<&DeepDive>, opts: PrintOpti
         identity.push("unsigned".into());
     }
     identity.push(t.binary.operating_system.display());
-    println!("  identity {}", identity.join(" · "));
-    println!("  entry    0x{:x}", t.binary.entry_point);
+    println!("{}", sty.field("identity", &identity.join(" · ")));
+    println!(
+        "{}",
+        sty.field(
+            "entry",
+            &sty.hash(&format!("0x{:x}", t.binary.entry_point))
+        )
+    );
     if let Some(ts) = t.binary.compile_timestamp {
-        println!("  compiled {}", format_compile_time(ts));
+        println!("{}", sty.field("compiled", &format_compile_time(ts)));
     }
 
     if let Some(tc) = t.toolchain.first() {
         println!(
-            "  toolchain {} (conf {}) — {}",
-            tc.language,
-            tc.confidence,
-            tc.evidence.iter().take(3).cloned().collect::<Vec<_>>().join("; ")
+            "{}",
+            sty.field(
+                "toolchain",
+                &format!(
+                    "{} (conf {}) — {}",
+                    tc.language,
+                    tc.confidence,
+                    tc.evidence
+                        .iter()
+                        .take(3)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                )
+            )
         );
     }
     if !t.packer_hints.is_empty() {
-        println!("  packer   {}", t.packer_hints.join("; "));
+        println!(
+            "{}",
+            sty.field("packer", &sty.packed(&t.packer_hints.join("; ")))
+        );
     }
 
     if !t.binary.sections.is_empty() {
-        println!("  sections");
+        println!();
+        println!("  {}", sty.key("sections"));
         for s in &t.binary.sections {
             let ent = t
                 .binary
@@ -240,74 +368,113 @@ fn print_sample_block(t: &TriageReport, deep: Option<&DeepDive>, opts: PrintOpti
                 .find(|e| e.name == s.name)
                 .map(|e| e.entropy)
                 .unwrap_or(0.0);
-            let flag = if ent >= 7.0 { "  packed?" } else { "" };
+            let ent_text = format!("{ent:.2}");
+            let flag = if ent >= 7.0 {
+                format!("  {}", sty.packed("packed?"))
+            } else {
+                String::new()
+            };
             println!(
-                "    {:<10}  raw={:<10}  entropy={:.2}{flag}",
+                "    {:<10}  {:<10}  {}{flag}",
                 s.name,
                 human_bytes(s.raw_size),
-                ent
+                sty.entropy(ent, &ent_text)
             );
         }
     }
 
     if !t.threat.capabilities.is_empty() {
-        println!("  caps");
+        println!();
+        println!("  {}", sty.key("caps"));
         for c in &t.threat.capabilities {
+            // Pad before coloring so ANSI codes do not break the column.
             println!(
-                "    {:>3}  {:<14}  {}",
-                c.confidence,
-                c.id,
-                c.evidence.join(", ")
+                "    {}  {}  {}",
+                sty.confidence_text(c.confidence, &format!("{:>3}", c.confidence)),
+                sty.cap_id(&format!("{:<14}", c.id)),
+                sty.dim(&c.evidence.join(", "))
             );
         }
     }
     if !t.threat.behaviors.is_empty() {
-        println!("  behaviors");
+        println!();
+        println!("  {}", sty.key("behaviors"));
         for b in &t.threat.behaviors {
             println!(
-                "    {:>3}  {}  ({})",
-                b.severity,
-                b.name,
-                b.matched_apis.join(", ")
+                "    {}  {}  {}",
+                sty.confidence_text(b.severity, &format!("{:>3}", b.severity)),
+                sty.cap_id(&format!("{:<22}", b.name)),
+                sty.dim(&format!("({})", b.matched_apis.join(", ")))
             );
         }
     }
     if !t.threat.suspicious_apis.is_empty() && opts.full {
-        println!("  suspicious {}", t.threat.suspicious_apis.join(", "));
+        println!();
+        println!(
+            "{}",
+            sty.field(
+                "suspicious",
+                &sty.dim(&t.threat.suspicious_apis.join(", "))
+            )
+        );
+    }
+
+    // Network / C2: prefer deep-dive (includes embedded-child merge), else triage scan.
+    let network = deep
+        .map(|d| d.network_iocs.as_slice())
+        .filter(|v| !v.is_empty())
+        .or_else(|| net.map(|n| n.iocs.as_slice()));
+    let dns_apis = net.map(|n| n.dns_apis.as_slice()).unwrap_or(&[]);
+    if network.is_some() || !dns_apis.is_empty() {
+        println!();
+        println!("  {}", sty.key("network"));
+        if !dns_apis.is_empty() {
+            println!("    {}  {}", sty.dim("dns"), sty.dim(&dns_apis.join(", ")));
+        }
+        if let Some(iocs) = network {
+            for ioc in iocs {
+                let priv_mark = if ioc.private {
+                    format!("  {}", sty.dim("private"))
+                } else {
+                    String::new()
+                };
+                let kind = match ioc.kind {
+                    IocKind::Ipv6 | IocKind::Ipv6Port => sty.hash(ioc.kind.label()),
+                    IocKind::Ipv4 | IocKind::Ipv4Port => sty.hash(ioc.kind.label()),
+                    IocKind::Domain | IocKind::Url | IocKind::Onion => sty.cap_id(ioc.kind.label()),
+                    other => other.label().to_string(),
+                };
+                println!(
+                    "    {:<8}  conf={}  {}{priv_mark}",
+                    kind,
+                    sty.confidence_text(ioc.confidence, &format!("{:<3}", ioc.confidence)),
+                    ioc.value
+                );
+            }
+        }
     }
 
     let Some(d) = deep else {
         return;
     };
 
-    if !d.network_iocs.is_empty() {
-        println!("  network");
-        for ioc in &d.network_iocs {
-            let priv_mark = if ioc.private { "  private" } else { "" };
-            println!(
-                "    {:>5}  conf={:<3}  {}{priv_mark}",
-                ioc.kind.label(),
-                ioc.confidence,
-                ioc.value
-            );
-        }
-    }
-
     if !d.crypto.is_empty() {
-        println!("  crypto");
+        println!();
+        println!("  {}", sty.key("crypto"));
         for c in &d.crypto {
             println!(
-                "    {:>3}  {} [{}] — {}",
-                c.confidence,
-                c.name,
+                "    {}  {} [{}] — {}",
+                sty.confidence_text(c.confidence, &format!("{:>3}", c.confidence)),
+                sty.cap_id(&c.name),
                 c.category.label(),
-                c.evidence
+                sty.dim(&c.evidence)
             );
         }
     }
 
     if !d.xor_recoveries.is_empty() {
-        println!("  xor");
+        println!();
+        println!("  {}", sty.key("xor"));
         for x in &d.xor_recoveries {
             let peers = if x.peers.is_empty() {
                 String::new()
@@ -315,64 +482,85 @@ fn print_sample_block(t: &TriageReport, deep: Option<&DeepDive>, opts: PrintOpti
                 format!("  peers={}", x.peers.join(","))
             };
             println!(
-                "    {}  conf={}  @0x{:x}  span={}{peers}",
+                "    {}  conf={}  {}  span={}{peers}",
                 x.scheme(),
                 x.confidence,
-                x.offset,
+                sty.hash(&format!("@0x{:x}", x.offset)),
                 human_bytes(x.length as u64),
             );
-            println!("      key    {}", x.key_display());
+            println!("      {} {}", sty.key("key"), x.key_display());
             if !x.preview.is_empty() {
-                println!("      plain  \"{}\"", x.preview);
+                println!("      {} \"{}\"", sty.key("plain"), x.preview);
             }
             if !x.evidence.is_empty() {
-                println!("      note   {}", x.evidence);
+                println!("      {} {}", sty.key("note"), sty.dim(&x.evidence));
             }
         }
     }
 
     if !d.secrets.is_empty() {
-        println!("  secrets");
-        for s in d.secrets.iter().filter(|s| s.score >= 75).take(8) {
-            println!("    {:>3}  [{}]  {}", s.score, s.kind.label(), s.value);
+        let secrets: Vec<_> = d.secrets.iter().filter(|s| s.score >= 75).take(8).collect();
+        if !secrets.is_empty() {
+            println!();
+            println!("  {}", sty.key("secrets"));
+            for s in secrets {
+                println!(
+                    "    {}  [{}]  {}",
+                    sty.confidence_text(s.score, &format!("{:>3}", s.score)),
+                    s.kind.label(),
+                    s.value
+                );
+            }
         }
     }
 
     if !d.yara.is_empty() {
-        println!("  yara");
+        println!();
+        println!("  {}", sty.key("yara"));
         for y in &d.yara {
             println!("    {}", y.rule);
         }
     }
 
     if !d.embedded_archives.is_empty() {
-        println!("  embedded");
+        println!();
+        println!("  {}", sty.key("embedded"));
         for a in &d.embedded_archives {
-            print_embedded_archive(a, opts);
+            print_embedded_archive(a, opts, sty);
         }
     }
 
     if !d.grouped_imports.is_empty() {
-        print_imports(&d.grouped_imports, opts);
+        println!();
+        print_imports(&d.grouped_imports, opts, sty);
     }
 
     if !d.interesting_strings.is_empty() {
-        print_strings(&d.interesting_strings, opts);
+        println!();
+        print_strings(&d.interesting_strings, opts, sty);
     }
 
     if let Some(dis) = &d.disasm {
+        println!();
         println!(
-            "  disasm   {}  start=0x{:x}  {} insn  {} fn",
-            dis.architecture,
-            dis.start_address,
-            dis.instructions.len(),
-            dis.functions.len()
+            "{}",
+            sty.field(
+                "disasm",
+                &format!(
+                    "{}  start={}  {} insn  {} fn",
+                    dis.architecture,
+                    sty.hash(&format!("0x{:x}", dis.start_address)),
+                    dis.instructions.len(),
+                    dis.functions.len()
+                )
+            )
         );
         if !dis.insights.is_empty() {
             for ins in &dis.insights {
                 println!(
-                    "    insight  {:>2}  {}  ({} hits)",
-                    ins.severity,
+                    "    {}  {}  {}  ({} hits)",
+                    sty.dim("insight"),
+                    sty.confidence_text(ins.severity, &format!("{:>2}", ins.severity)),
                     ins.label,
                     ins.hits.len()
                 );
@@ -386,18 +574,18 @@ fn print_sample_block(t: &TriageReport, deep: Option<&DeepDive>, opts: PrintOpti
                 continue;
             }
             println!(
-                "    fn  interest={:>3}  0x{:<8x}  {:<24}  {}",
-                f.interest,
-                f.start,
+                "    fn  interest={}  {}  {:<24}  {}",
+                sty.confidence_text(f.interest, &format!("{:>3}", f.interest)),
+                sty.hash(&format!("0x{:<8x}", f.start)),
                 truncate(&f.name, 24),
-                f.cluster_label
+                sty.dim(&f.cluster_label)
             );
         }
     }
 }
 
-fn print_imports(grouped: &[(String, Vec<String>)], opts: PrintOptions) {
-    println!("  imports");
+fn print_imports(grouped: &[(String, Vec<String>)], opts: PrintOptions, sty: Style) {
+    println!("  {}", sty.key("imports"));
     for (lib, fns) in grouped {
         let lower = lib.to_ascii_lowercase();
         let is_crt = lower.contains("msvcr")
@@ -406,7 +594,11 @@ fn print_imports(grouped: &[(String, Vec<String>)], opts: PrintOptions) {
             || lower.contains("vcruntime")
             || lower == "libgcc_s_dw2-1.dll";
         if is_crt && !opts.full {
-            println!("    {lib}  ({} crt helpers — hidden, use --full)", fns.len());
+            println!(
+                "    {}  {}",
+                sty.lib(lib),
+                sty.dim(&format!("({} crt helpers — hidden, use --full)", fns.len()))
+            );
             continue;
         }
         let interesting: Vec<&String> = fns
@@ -414,18 +606,25 @@ fn print_imports(grouped: &[(String, Vec<String>)], opts: PrintOptions) {
             .filter(|f| opts.full || !is_mangled(f))
             .collect();
         if interesting.is_empty() {
-            println!("    {lib}  ({} fns)", fns.len());
+            println!(
+                "    {}  {}",
+                sty.lib(lib),
+                sty.dim(&format!("({} fns)", fns.len()))
+            );
             continue;
         }
-        println!("    {lib}  ({})", interesting.len());
-        // Wrap roughly.
+        println!(
+            "    {}  {}",
+            sty.lib(lib),
+            sty.dim(&format!("({})", interesting.len()))
+        );
         let joined = interesting
             .iter()
             .map(|s| s.as_str())
             .collect::<Vec<_>>()
             .join(", ");
-        for chunk in wrap_line(&joined, 70) {
-            println!("      {chunk}");
+        for chunk in wrap_line(&joined, IMPORT_WRAP) {
+            println!("      {}", sty.dim(&chunk));
         }
     }
 }
@@ -433,6 +632,7 @@ fn print_imports(grouped: &[(String, Vec<String>)], opts: PrintOptions) {
 fn print_strings(
     strings: &[vanguard_re::disasm::ExtractedString],
     opts: PrintOptions,
+    sty: Style,
 ) {
     let filtered: Vec<_> = strings
         .iter()
@@ -443,20 +643,24 @@ fn print_strings(
     } else {
         STRING_CAP.min(filtered.len())
     };
-    println!("  strings  showing {cap} of {}", strings.len());
+    println!(
+        "  {}  {}",
+        sty.key("strings"),
+        sty.dim(&format!("showing {cap} of {}", strings.len()))
+    );
     for s in filtered.iter().take(cap) {
         println!(
-            "    @0x{:<8x}  {}",
-            s.offset,
+            "    {}  {}",
+            sty.dim(&format!("@0x{:<8x}", s.offset)),
             truncate(&s.value, 90)
         );
     }
     if filtered.len() > cap {
-        println!("    … {} more", filtered.len() - cap);
+        println!("    {} {} more", sty.dim("…"), filtered.len() - cap);
     }
 }
 
-fn print_embedded_archive(a: &EmbeddedArchive, opts: PrintOptions) {
+fn print_embedded_archive(a: &EmbeddedArchive, opts: PrintOptions, sty: Style) {
     println!(
         "    {}  @{}  span={}  members={}  extracted={}  encrypted={}",
         a.label,
@@ -467,7 +671,7 @@ fn print_embedded_archive(a: &EmbeddedArchive, opts: PrintOptions) {
         a.encrypted_count()
     );
     if let Some(pw) = &a.recovered_password {
-        println!("      password  {pw}");
+        println!("      {} {}", sty.key("password"), pw);
     }
 
     let (priority, rest): (Vec<_>, Vec<_>) = a
@@ -514,9 +718,13 @@ fn print_embedded_archive(a: &EmbeddedArchive, opts: PrintOptions) {
             })
             .count();
         if msg_n > 0 && !opts.full {
-            println!("      … {remaining} more ({msg_n} language packs)");
+            println!(
+                "      {} {}",
+                sty.dim("…"),
+                sty.dim(&format!("{remaining} more ({msg_n} language packs)"))
+            );
         } else {
-            println!("      … {remaining} more");
+            println!("      {} {} more", sty.dim("…"), remaining);
         }
     }
 }
@@ -548,10 +756,7 @@ fn compact_hash_name(name: &str) -> String {
         Some(i) if i > 0 && i < name.len() - 1 => (&name[..i], &name[i..]),
         _ => (name, ""),
     };
-    let hexish = stem.len() >= 32
-        && stem
-            .chars()
-            .all(|c| c.is_ascii_hexdigit());
+    let hexish = stem.len() >= 32 && stem.chars().all(|c| c.is_ascii_hexdigit());
     if hexish {
         format!("{}…{}", &stem[..8], ext)
     } else if name.len() > 36 {
@@ -569,7 +774,10 @@ fn format_compile_time(ts: u32) -> String {
         return format!("0x{ts:08x} ({ts})");
     };
     // Manual UTC date without chrono dependency.
-    let secs = datetime.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let secs = datetime
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     let (y, m, d, hh, mm, ss) = civil_from_days(secs);
     format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}:{ss:02} UTC  (0x{ts:08x})")
 }
@@ -609,7 +817,10 @@ fn is_interesting_string(s: &str) -> bool {
         return false;
     }
     // WannaCry language-pack path dumps dominate otherwise.
-    if lower.contains("msg/m_") || lower.contains("/m_") || (lower.starts_with("m_") && lower.contains(".wnry")) {
+    if lower.contains("msg/m_")
+        || lower.contains("/m_")
+        || (lower.starts_with("m_") && lower.contains(".wnry"))
+    {
         return false;
     }
     if lower.starts_with("microsoft visual") || lower.contains("runtime error") {

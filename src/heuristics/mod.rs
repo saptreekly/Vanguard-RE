@@ -1,10 +1,12 @@
 //! Heuristic & API threat scoring (IAT behavioral profiling).
 
 mod capabilities;
+mod scripts;
 
 pub use capabilities::{
     capability_summary, tag_capabilities, tag_capabilities_from_names, CapabilityTag,
 };
+pub use scripts::{harvest_script_strings, ScriptFamily, ScriptHit};
 
 use crate::triage::ImportEntry;
 
@@ -328,7 +330,7 @@ pub fn harvest_network_api_strings(data: &[u8]) -> Vec<String> {
     found
 }
 
-fn ascii_runs(data: &[u8], min_len: usize) -> Vec<String> {
+pub(crate) fn ascii_runs(data: &[u8], min_len: usize) -> Vec<String> {
     let mut out = Vec::new();
     let mut start = None;
     for (i, &b) in data.iter().enumerate() {
@@ -354,7 +356,7 @@ fn ascii_runs(data: &[u8], min_len: usize) -> Vec<String> {
     out
 }
 
-fn utf16le_runs(data: &[u8], min_chars: usize) -> Vec<String> {
+pub(crate) fn utf16le_runs(data: &[u8], min_chars: usize) -> Vec<String> {
     let mut out = Vec::new();
     let mut i = 0;
     while i + 1 < data.len() {
@@ -382,11 +384,12 @@ fn utf16le_runs(data: &[u8], min_chars: usize) -> Vec<String> {
 
 /// Score a binary's import table against known malicious operational patterns.
 pub fn score_imports(imports: &[ImportEntry]) -> ThreatScore {
-    score_api_evidence(api_names(imports))
+    score_api_evidence(api_names(imports), &[])
 }
 
 /// Like [`score_imports`], but also folds exact network API name strings when the
-/// IAT already shows dynamic resolution (thin-IAT / delay-load stealers).
+/// IAT already shows dynamic resolution (thin-IAT / delay-load stealers), and
+/// always scans for shell/script/LOLBin launch strings.
 pub fn score_imports_with_string_apis(imports: &[ImportEntry], data: &[u8]) -> ThreatScore {
     let mut apis = api_names(imports);
     if has_dyn_resolve(&apis) {
@@ -396,10 +399,11 @@ pub fn score_imports_with_string_apis(imports: &[ImportEntry], data: &[u8]) -> T
             }
         }
     }
-    score_api_evidence(apis)
+    let script_hits = scripts::harvest_script_strings(data);
+    score_api_evidence(apis, &script_hits)
 }
 
-fn score_api_evidence(apis: Vec<String>) -> ThreatScore {
+fn score_api_evidence(apis: Vec<String>, script_hits: &[scripts::ScriptHit]) -> ThreatScore {
     let suspicious_apis: Vec<String> = apis
         .iter()
         .filter(|a| SUSPICIOUS_APIS.iter().any(|s| api_matches(a, s)))
@@ -422,16 +426,25 @@ fn score_api_evidence(apis: Vec<String>) -> ThreatScore {
             });
         }
     }
+    if let Some(b) = scripts::script_launch_behavior(script_hits, &apis) {
+        behaviors.push(b);
+    }
 
     let max_sev = behaviors.iter().map(|b| b.severity).max().unwrap_or(0);
     let density_bump = (suspicious_apis.len().min(20) as u8).saturating_mul(2);
-    let capabilities = tag_capabilities_from_names(&apis);
+    let mut capabilities = tag_capabilities_from_names(&apis);
+    if let Some(cap) =
+        scripts::script_capability(script_hits, scripts::has_exec_api(&apis))
+    {
+        capabilities.push(cap);
+        capabilities.sort_by(|a, b| b.confidence.cmp(&a.confidence).then(a.id.cmp(&b.id)));
+    }
     let cap_bump: u8 = capabilities
         .iter()
         .map(|c| match c.id.as_str() {
             "injection" => 12,
             "c2_suspect" | "keylog" | "privilege" => 8,
-            "socket_client" | "http_client" | "smb_enum" => 7,
+            "socket_client" | "http_client" | "smb_enum" | "script_exec" => 7,
             "persistence" | "crypto" | "anti_debug" | "file_delete" => 6,
             _ => 3,
         })
@@ -471,9 +484,13 @@ fn is_network_cap(id: &str) -> bool {
     )
 }
 
+fn is_highlight_cap(id: &str) -> bool {
+    is_network_cap(id) || id == "script_exec" || id == "exec"
+}
+
 /// Pick up to 3 capability ids for the ranking label: highest confidence first,
-/// then prefer including one network-class tag when present so Conti-style SMB
-/// discovery is visible beside crypto/file_drop.
+/// then prefer including one network/script-class tag when present so Conti-style
+/// SMB discovery (or script launch) is visible beside crypto/file_drop.
 fn label_capability_ids(capabilities: &[CapabilityTag]) -> Vec<&str> {
     if capabilities.is_empty() {
         return Vec::new();
@@ -481,11 +498,11 @@ fn label_capability_ids(capabilities: &[CapabilityTag]) -> Vec<&str> {
     let mut chosen: Vec<&str> = Vec::with_capacity(3);
     chosen.push(capabilities[0].id.as_str());
 
-    if let Some(net) = capabilities
+    if let Some(hi) = capabilities
         .iter()
-        .find(|c| is_network_cap(&c.id) && c.id != chosen[0])
+        .find(|c| is_highlight_cap(&c.id) && c.id != chosen[0])
     {
-        chosen.push(net.id.as_str());
+        chosen.push(hi.id.as_str());
     }
 
     for cap in capabilities.iter().skip(1) {
@@ -713,6 +730,33 @@ mod tests {
             !score.capabilities.iter().any(|c| c.id == "http_client"),
             "must not promote WinINet strings without dyn_resolve: {:?}",
             score.capabilities
+        );
+    }
+
+    #[test]
+    fn script_strings_tag_script_exec_with_createprocess() {
+        let imports = imports(&["CreateProcessA", "CloseHandle"]);
+        let data = b"C:\\Windows\\System32\\cmd.exe /c powershell.exe -enc SQBFAFgA\0";
+        let score = score_imports_with_string_apis(&imports, data);
+        assert!(
+            score.capabilities.iter().any(|c| c.id == "script_exec"),
+            "expected script_exec: {:?}",
+            score.capabilities
+        );
+        assert!(
+            score.capabilities.iter().any(|c| c.id == "exec"),
+            "expected exec: {:?}",
+            score.capabilities
+        );
+        assert!(
+            score.behaviors.iter().any(|b| b.name == "script_launch"),
+            "expected script_launch behavior: {:?}",
+            score.behaviors
+        );
+        assert!(
+            score.label.contains("script_exec") || score.label.contains("exec"),
+            "label should surface launch cap: {}",
+            score.label
         );
     }
 }

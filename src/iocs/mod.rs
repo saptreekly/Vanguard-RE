@@ -13,6 +13,8 @@ pub enum IocKind {
     Url,
     Ipv4Port,
     Ipv4,
+    Ipv6Port,
+    Ipv6,
     Onion,
     Domain,
     Email,
@@ -26,11 +28,27 @@ impl IocKind {
             Self::Url => "URL",
             Self::Ipv4Port => "IP:PORT",
             Self::Ipv4 => "IPV4",
+            Self::Ipv6Port => "IP6:PORT",
+            Self::Ipv6 => "IPV6",
             Self::Onion => "ONION",
             Self::Domain => "DOMAIN",
             Self::Email => "EMAIL",
             Self::Bitcoin => "BTC",
         }
+    }
+
+    /// Hostname / address class useful as a C2 pivot (excludes email/BTC noise).
+    pub fn is_c2_candidate(self) -> bool {
+        matches!(
+            self,
+            Self::Url
+                | Self::Ipv4
+                | Self::Ipv4Port
+                | Self::Ipv6
+                | Self::Ipv6Port
+                | Self::Domain
+                | Self::Onion
+        )
     }
 }
 
@@ -108,6 +126,11 @@ fn is_vendor_host_fragment(host: &str) -> bool {
 
 /// Extract network IOCs from raw sample bytes (ASCII + UTF-16LE strings).
 pub fn scan_data(data: &[u8]) -> Vec<NetworkIoc> {
+    scan_data_limited(data, 40)
+}
+
+/// Like [`scan_data`], with a configurable result cap (C2 hunt uses a larger budget).
+pub fn scan_data_limited(data: &[u8], limit: usize) -> Vec<NetworkIoc> {
     // Large ranked set — packer noise must not starve C2 domains.
     let strings = extract_strings_ranked(data, 12_000);
     let mut found: BTreeMap<String, NetworkIoc> = BTreeMap::new();
@@ -119,6 +142,7 @@ pub fn scan_data(data: &[u8]) -> Vec<NetworkIoc> {
     scan_raw_domains(data, &mut found);
     scan_raw_onions(data, &mut found);
     scan_raw_bitcoin(data, &mut found);
+    scan_raw_ipv6(data, &mut found);
 
     // Drop bare domains/IPs that already appear inside a captured URL.
     let urls: Vec<String> = found
@@ -138,7 +162,7 @@ pub fn scan_data(data: &[u8]) -> Vec<NetworkIoc> {
             .then(b.count.cmp(&a.count))
             .then(a.value.cmp(&b.value))
     });
-    out.truncate(40);
+    out.truncate(limit);
     out
 }
 
@@ -155,6 +179,7 @@ fn add(found: &mut BTreeMap<String, NetworkIoc>, ioc: NetworkIoc) {
 fn scan_text(text: &str, found: &mut BTreeMap<String, NetworkIoc>) {
     scan_urls(text, found);
     scan_ipv4(text, found);
+    scan_ipv6(text, found);
     scan_tokens(text, found);
     scan_bitcoin_text(text, found);
 }
@@ -181,18 +206,18 @@ fn scan_urls(text: &str, found: &mut BTreeMap<String, NetworkIoc>) {
             if host_only.is_empty() || is_noise_host(host_only) || is_noise_host(url) {
                 continue;
             }
-            let (confidence, private) = match parse_ipv4(host_only) {
-                Some(octets) => {
-                    let private = is_private(octets);
-                    (if private { 40 } else { 95 }, private)
+            let (confidence, private) = if let Some(octets) = parse_ipv4(host_only) {
+                let private = is_private(octets);
+                (if private { 40 } else { 95 }, private)
+            } else if looks_like_ipv6(host_only.trim_matches(['[', ']'])) {
+                let private = is_private_ipv6(host_only.trim_matches(['[', ']']));
+                (if private { 40 } else { 95 }, private)
+            } else {
+                // Require a plausible domain — rejects `http://schemas.mic`.
+                if !looks_like_domain(host_only) {
+                    continue;
                 }
-                None => {
-                    // Require a plausible domain — rejects `http://schemas.mic`.
-                    if !looks_like_domain(host_only) {
-                        continue;
-                    }
-                    (85, false)
-                }
+                (85, false)
             };
             add(
                 found,
@@ -232,6 +257,187 @@ fn is_private(o: [u8; 4]) -> bool {
         || (o[0] == 172 && (16..=31).contains(&o[1]))
         || (o[0] == 192 && o[1] == 168)
         || o[0] >= 224 // multicast + reserved
+}
+
+/// True for a plausible IPv6 literal (compressed `::` allowed). Not a full RFC
+/// parser — good enough for malware string triage.
+pub fn looks_like_ipv6(s: &str) -> bool {
+    let s = s.trim();
+    if s.len() < 2 || s.len() > 45 || !s.contains(':') {
+        return false;
+    }
+    // IPv4:port has a single colon and decimal sides — never IPv6.
+    if s.matches(':').count() == 1 {
+        let (left, right) = s.split_once(':').unwrap();
+        if left.bytes().all(|b| b.is_ascii_digit()) && right.bytes().all(|b| b.is_ascii_digit()) {
+            return false;
+        }
+    }
+    let mut parts = s.split("::");
+    let (head, tail) = match (parts.next(), parts.next(), parts.next()) {
+        (Some(h), None, None) => (h, ""),
+        (Some(h), Some(t), None) => (h, t),
+        _ => return false, // more than one `::`
+    };
+    let mut groups = 0usize;
+    for side in [head, tail] {
+        if side.is_empty() {
+            continue;
+        }
+        for g in side.split(':') {
+            if g.is_empty() {
+                return false;
+            }
+            // Embedded IPv4 in last group: ::ffff:192.0.2.1
+            if g.contains('.') {
+                if parse_ipv4(g).is_none() {
+                    return false;
+                }
+                groups += 2; // counts as two hextets
+                continue;
+            }
+            if g.len() > 4 || !g.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return false;
+            }
+            groups += 1;
+        }
+    }
+    if s.contains("::") {
+        groups < 8
+    } else {
+        groups == 8
+    }
+}
+
+fn is_private_ipv6(s: &str) -> bool {
+    let lower = s.to_ascii_lowercase();
+    lower == "::1"
+        || lower.starts_with("fe80:")
+        || lower.starts_with("fc")
+        || lower.starts_with("fd")
+        || lower.starts_with("::ffff:") // IPv4-mapped — treat conservatively
+}
+
+/// Scan free text for IPv6 literals, including `[addr]:port`.
+fn scan_ipv6(text: &str, found: &mut BTreeMap<String, NetworkIoc>) {
+    let b = text.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        // Bracketed form: [2001:db8::1]:443
+        if b[i] == b'[' {
+            if let Some(rel_end) = text[i + 1..].find(']') {
+                let addr = &text[i + 1..i + 1 + rel_end];
+                let after = i + 1 + rel_end + 1;
+                if looks_like_ipv6(addr) {
+                    let private = is_private_ipv6(addr);
+                    let mut end = after;
+                    let mut kind = IocKind::Ipv6;
+                    let mut value = addr.to_ascii_lowercase();
+                    let mut confidence = if private { 30 } else { 78 };
+                    if after < b.len() && b[after] == b':' {
+                        let mut j = after + 1;
+                        let mut port: u32 = 0;
+                        let mut len = 0;
+                        while j < b.len() && b[j].is_ascii_digit() && len < 5 {
+                            port = port * 10 + u32::from(b[j] - b'0');
+                            j += 1;
+                            len += 1;
+                        }
+                        if len > 0 && port > 0 && port <= 65535 {
+                            kind = IocKind::Ipv6Port;
+                            value = text[i..j].to_ascii_lowercase();
+                            confidence = if private { 40 } else { 92 };
+                            end = j;
+                        }
+                    }
+                    if !(private && kind == IocKind::Ipv6) {
+                        add(
+                            found,
+                            NetworkIoc {
+                                kind,
+                                value,
+                                confidence,
+                                count: 1,
+                                private,
+                            },
+                        );
+                    }
+                    i = end;
+                    continue;
+                }
+            }
+            i += 1;
+            continue;
+        }
+
+        // Unbracketed: start at hex or ':' (for ::1)
+        let c = b[i];
+        if !(c.is_ascii_hexdigit() || c == b':') {
+            i += 1;
+            continue;
+        }
+        if i > 0 {
+            let prev = b[i - 1];
+            if prev.is_ascii_alphanumeric() || prev == b':' || prev == b'.' {
+                i += 1;
+                continue;
+            }
+        }
+        let start = i;
+        let mut j = i;
+        while j < b.len()
+            && (b[j].is_ascii_hexdigit() || b[j] == b':' || b[j] == b'.')
+        {
+            j += 1;
+        }
+        let candidate = &text[start..j];
+        if looks_like_ipv6(candidate) {
+            let private = is_private_ipv6(candidate);
+            // Bare private/link-local without brackets is usually noise.
+            if !private {
+                add(
+                    found,
+                    NetworkIoc {
+                        kind: IocKind::Ipv6,
+                        value: candidate.to_ascii_lowercase(),
+                        confidence: 75,
+                        count: 1,
+                        private: false,
+                    },
+                );
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// Contiguous printable-run pass for IPv6 (same idea as raw domain scan).
+fn scan_raw_ipv6(data: &[u8], found: &mut BTreeMap<String, NetworkIoc>) {
+    let window = &data[..data.len().min(4 * 1024 * 1024)];
+    let mut start = None;
+    for (i, &b) in window.iter().enumerate() {
+        let ok = b.is_ascii_hexdigit() || b == b':' || b == b'.' || b == b'[' || b == b']';
+        if ok {
+            if start.is_none() {
+                start = Some(i);
+            }
+        } else if let Some(s) = start.take() {
+            if i - s >= 4 {
+                if let Ok(text) = std::str::from_utf8(&window[s..i]) {
+                    scan_ipv6(text, found);
+                }
+            }
+        }
+    }
+    if let Some(s) = start {
+        if window.len() - s >= 4 {
+            if let Ok(text) = std::str::from_utf8(&window[s..]) {
+                scan_ipv6(text, found);
+            }
+        }
+    }
 }
 
 /// Scan free text for dotted-quad IPs with optional `:port`.
@@ -835,5 +1041,40 @@ mod tests {
         let s = format!("hidden {host}.onion done");
         let iocs = scan_data(s.as_bytes());
         assert!(iocs.iter().any(|i| i.kind == IocKind::Onion));
+    }
+
+    #[test]
+    fn finds_ipv6_and_bracketed_port() {
+        let data = b"beacon [2001:db8:85a3::8a2e:370:7334]:8443 and also 2001:db8::1 fallback";
+        let iocs = scan_data(data);
+        assert!(
+            iocs.iter().any(|i| {
+                i.kind == IocKind::Ipv6Port && i.value.contains("2001:db8:85a3::8a2e:370:7334")
+            }),
+            "missing bracketed IPv6:port: {iocs:?}"
+        );
+        assert!(
+            iocs.iter()
+                .any(|i| i.kind == IocKind::Ipv6 && i.value == "2001:db8::1"),
+            "missing bare IPv6: {iocs:?}"
+        );
+    }
+
+    #[test]
+    fn skips_loopback_ipv6() {
+        let data = b"local ::1 only";
+        let iocs = scan_data(data);
+        assert!(
+            iocs.iter().all(|i| i.value != "::1"),
+            "loopback IPv6 should be suppressed: {iocs:?}"
+        );
+    }
+
+    #[test]
+    fn looks_like_ipv6_basic() {
+        assert!(looks_like_ipv6("2001:db8::1"));
+        assert!(looks_like_ipv6("::ffff:192.0.2.1"));
+        assert!(!looks_like_ipv6("185.220.101.5:443"));
+        assert!(!looks_like_ipv6("not:an:ip:address:here:too:many:groups:extra"));
     }
 }

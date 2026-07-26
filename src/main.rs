@@ -24,26 +24,35 @@ struct Args {
     #[arg(short, long, default_value = "infected")]
     password: String,
 
-    /// Number of top-scoring samples to deep-dive
-    #[arg(long, default_value_t = 3)]
+    /// Max deep-dives (default: no practical cap — every executable / scored member)
+    #[arg(long, default_value_t = usize::MAX)]
     deep: usize,
 
     /// Max instructions to decode per deep-dive disassembly
-    #[arg(long, default_value_t = 4000)]
+    #[arg(long, default_value_t = 32_768)]
     disasm_count: usize,
 
-    /// Minimum triage score required for a deep-dive
-    #[arg(long, default_value_t = 70)]
+    /// Minimum triage score for non-executable deep-dives (0 = include all scored)
+    #[arg(long, default_value_t = 0)]
     min_deep_score: u8,
 
-    /// Absolute ceiling on deep-dives (top `--deep` plus min-score fill)
-    #[arg(long, default_value_t = 8)]
+    /// Absolute ceiling on deep-dives (default: unlimited)
+    #[arg(long, default_value_t = usize::MAX)]
     max_deep: usize,
 
     /// Keep language packs / source / raw noise in ranking, and print full
     /// member lists / triage for every sample
     #[arg(long, default_value_t = false)]
     full: bool,
+
+    /// When to use ANSI colors in the report [auto|always|never]
+    #[arg(long, default_value = "auto", value_parser = parse_color)]
+    color: cli::ColorChoice,
+}
+
+fn parse_color(s: &str) -> Result<cli::ColorChoice, String> {
+    cli::ColorChoice::parse(s)
+        .ok_or_else(|| format!("invalid color mode '{s}'; expected auto, always, or never"))
 }
 
 fn main() -> Result<()> {
@@ -75,7 +84,10 @@ fn main() -> Result<()> {
         &args.path,
         &samples,
         &report,
-        cli::PrintOptions { full: args.full },
+        cli::PrintOptions {
+            full: args.full,
+            color: args.color,
+        },
     );
     Ok(())
 }
